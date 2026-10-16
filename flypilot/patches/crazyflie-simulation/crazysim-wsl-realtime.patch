@@ -1,0 +1,165 @@
+diff --git a/simulator_files/mujoco/crazysim.py b/simulator_files/mujoco/crazysim.py
+index d4a7eb9..202fbea 100644
+--- a/simulator_files/mujoco/crazysim.py
++++ b/simulator_files/mujoco/crazysim.py
+@@ -414,6 +414,12 @@ class CameraRenderer:
+ 
+     Frames are split into numbered UDP chunks so they fit in datagrams.
+     Chunk format: [seq:u16][total:u16][width:u16][height:u16][data]
++
++    Rendering runs on a worker thread from a snapshot of MjData, so a slow GPU
++    readback (tens of ms under WSL2 while the viewer shares the GPU) never
++    stalls the physics loop. If a frame comes due while the previous one is
++    still rendering, it is rendered from the newest state as soon as the
++    worker frees up, instead of waiting for the next frame slot.
+     """
+ 
+     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
+@@ -424,7 +430,8 @@ class CameraRenderer:
+                                           self._cam_name)
+         if self._cam_id < 0:
+             raise ValueError(f'Camera {self._cam_name!r} not found in model')
+-        self._renderer = mujoco.Renderer(model, height=height, width=width)
++        self._model = model
++        self._snapshot = mujoco.MjData(model)
+         self._width = width
+         self._height = height
+         self._frame_period = 1.0 / fps
+@@ -436,15 +443,38 @@ class CameraRenderer:
+         print(f'[crazysim] Agent {agent_id}: camera frames → '
+               f'udp://127.0.0.1:{self._port}')
+ 
++        self._busy = threading.Event()     # set while the worker owns _snapshot
++        self._frame_due = threading.Event()
++        self._pending = False              # a frame is due but the worker was busy
++        self._running = True
++        threading.Thread(target=self._render_loop, daemon=True).start()
++
+     def maybe_render(self, model: mujoco.MjModel, data: mujoco.MjData,
+                      dt: float):
+         self._acc += dt
+-        if self._acc < self._frame_period:
++        if self._acc >= self._frame_period:
++            self._acc -= self._frame_period
++            self._pending = True
++        if not self._pending or self._busy.is_set():
+             return
+-        self._acc -= self._frame_period
++        self._pending = False
++        mujoco.mj_copyData(self._snapshot, model, data)
++        self._busy.set()
++        self._frame_due.set()
++
++    def _render_loop(self):
++        # The GL context must be created on the thread that renders with it.
++        renderer = mujoco.Renderer(self._model, height=self._height, width=self._width)
++        while self._running:
++            if not self._frame_due.wait(timeout=0.5):
++                continue
++            self._frame_due.clear()
++            renderer.update_scene(self._snapshot, camera=self._cam_name)
++            pixels = renderer.render()
++            self._busy.clear()
++            self._send(pixels)
+ 
+-        self._renderer.update_scene(data, camera=self._cam_name)
+-        pixels = self._renderer.render()
++    def _send(self, pixels: np.ndarray):
+         gray = np.dot(pixels[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+         img_bytes = gray.tobytes()
+ 
+@@ -460,6 +490,7 @@ class CameraRenderer:
+                 pass
+ 
+     def stop(self):
++        self._running = False
+         self._sock.close()
+ 
+ 
+@@ -1231,6 +1262,10 @@ class CrazySimMuJoCo:
+         # Build shared MuJoCo model with all drones
+         self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
+         self.model.opt.timestep = self.dt
++        # No mirror-like floors, in the viewer or the FPV camera: a real AI-deck doesn't see
++        # mirrored obstacles (spurious motion for a looming detector), and each reflective pass
++        # costs ~15 ms per frame under WSL2. Visual only; shadows are kept.
++        self.model.mat_reflectance[:] = 0.0
+         self.data = mujoco.MjData(self.model)
+ 
+         # Create per-drone agents
+@@ -1334,14 +1369,42 @@ class CrazySimMuJoCo:
+                 _rtf_wall_start = wall_now
+                 _rtf_sim_start = self.data.time
+ 
++        def _pace(next_step):
++            """Sleep until the next step's absolute deadline. Pacing each step by
++            dt - elapsed never recovers time lost to slow steps (camera renders),
++            which held the sim near 0.5x real time; this catches up instead,
++            resyncing if more than 50 ms behind."""
++            next_step += self.dt
++            sleep_t = next_step - time.perf_counter()
++            if sleep_t > 0:
++                time.sleep(sleep_t)
++            elif sleep_t < -0.05:
++                next_step = time.perf_counter()
++            return next_step
++
+         if self.visualize:
+             _render_interval = 1.0 / 60.0  # 60 FPS render rate
+             with mujoco.viewer.launch_passive(self.model, self.data,
+                                               show_left_ui=False,
+                                               show_right_ui=False) as v:
++                # set_texts() blocks until the viewer draws its next frame, which under
++                # WSLg can take tens of ms; calling it from the physics loop throttled the
++                # sim to a few % of real time. Update the overlay from its own thread.
++                def _overlay_loop():
++                    while v.is_running() and self._running:
++                        v.set_texts((
++                            mujoco.mjtFontScale.mjFONTSCALE_150,
++                            mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
++                            f'RTF: {_rtf_value:.2f}x',
++                            f't={self.data.time:.1f}s',
++                        ))
++                        time.sleep(0.5)
++                threading.Thread(target=_overlay_loop, daemon=True).start()
++
+                 # Force initial camera: look from behind drone toward +X.
+                 _cam_init_frames = 5
+                 _last_render = 0.0
++                _next_step = time.perf_counter()
+                 while v.is_running() and self._running:
+                     t0 = time.perf_counter()
+                     with v.lock():
+@@ -1355,29 +1418,17 @@ class CrazySimMuJoCo:
+                             _cam_init_frames -= 1
+                     _update_rtf()
+                     if t0 - _last_render >= _render_interval:
+-                        v.set_texts((
+-                            mujoco.mjtFontScale.mjFONTSCALE_150,
+-                            mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
+-                            f'RTF: {_rtf_value:.2f}x',
+-                            f't={self.data.time:.1f}s',
+-                        ))
+                         v.sync()
+                         _last_render = t0
+-                    elapsed = time.perf_counter() - t0
+-                    sleep_t = self.dt - elapsed
+-                    if sleep_t > 0:
+-                        time.sleep(sleep_t)
++                    _next_step = _pace(_next_step)
+             self._running = False
+         else:
+             try:
++                _next_step = time.perf_counter()
+                 while self._running:
+-                    t0 = time.perf_counter()
+                     _step_and_send()
+                     _update_rtf()
+-                    elapsed = time.perf_counter() - t0
+-                    sleep_t = self.dt - elapsed
+-                    if sleep_t > 0:
+-                        time.sleep(sleep_t)
++                    _next_step = _pace(_next_step)
+             except KeyboardInterrupt:
+                 pass
+ 

@@ -1,0 +1,213 @@
+FLY BRAIN PILOT - flypilot/ : HOW TO SET UP, RUN AND TEST
+=========================================================
+
+What this is
+  A simulated Crazyflie drone in CrazySim: MuJoCo physics plus the real Crazyflie firmware, a 3D
+  window, the drone's own camera view, and Python flight scripts. This is milestone M3: ordinary
+  flight control only. There is no fly-brain code here yet.
+
+You run everything from a normal Windows terminal (PowerShell, cmd, or the VS Code terminal). The
+.cmd files start everything inside WSL for you, so you never have to open WSL yourself. The
+commands below assume your terminal is in the repo folder.
+
+
+1. WHAT YOUR PC NEEDS
+---------------------
+  - Windows 11, or Windows 10 version 21H2 or newer (needed for WSLg, which shows Linux windows
+    on your desktop).
+  - A GPU that WSL can use. You do NOT need a gaming GPU. WSL draws through your normal Windows
+    graphics driver (DirectX 12), so most NVIDIA, AMD or Intel GPUs from the last several years
+    should work, including the integrated graphics in most laptops, as long as the driver is up
+    to date.
+  - About 2 GB of free disk space inside WSL (sim + firmware build + Python packages).
+  - 2 CPU cores are enough; any normal PC has at least that.
+
+  What we measured on one PC (RTX 4080, 20 cores), emulating weaker machines:
+    GPU, 20 cores ........... sim at real time, camera 20 fps, waypoint flight OK
+    GPU, only 4 cores ....... same: real time, 20 fps, flight OK
+    GPU, only 2 cores ....... flight OK, timing clean
+    GPU, only 1 core ........ flight completed, but the sim fell behind real time at moments
+                              (no safety margin)
+    NO GPU (CPU drawing) .... sim falls ~10% behind real time and the flight FAILS (drifts or
+                              tumbles). A working GPU is the one hard requirement.
+  Not tested yet: integrated laptop graphics, AMD, Intel. If you try one, tell the team how it
+  went (RTF number and whether the waypoint flight passed).
+
+  launch.cmd prints the graphics renderer it is using, and warns you when there is no GPU.
+
+
+2. ONE-TIME SETUP
+-----------------
+  a) Install WSL with Ubuntu (skip if you already have it). In PowerShell run as Administrator:
+         wsl --install -d Ubuntu-24.04
+     Reboot if asked. Then open "Ubuntu" from the Start menu once, create a Linux username and
+     password when it asks, and close it.
+     (Ubuntu 22.04 should also work, but 24.04 is what we tested.)
+
+  b) Make sure WSL is current, so Linux windows can open:
+         wsl --update
+
+  c) Clone this repo anywhere on Windows, open a terminal in the repo folder, and run:
+         flypilot\setup.cmd
+     The first run takes about 5-10 minutes. It:
+       - installs build tools and graphics libraries inside WSL (runs as root, so no password
+         prompt)
+       - downloads CrazySim into ~/CrazySim inside WSL, pinned to the version we tested
+       - applies our two fixes from flypilot\patches\ (see section 6)
+       - creates the Python environment ~/.venvs/flybrain and installs
+         flypilot\requirements.txt
+       - builds the simulated Crazyflie firmware
+     It ends with "Setup finished". It is safe to re-run at any time, e.g. after a git pull
+     that changes requirements or patches.
+
+  More than one WSL distro? The scripts use your default one. To pick another, set this first,
+  in the same terminal:
+         PowerShell:  $env:FLYPILOT_DISTRO = "Ubuntu-24.04"
+         cmd:         set FLYPILOT_DISTRO=Ubuntu-24.04
+  ("wsl -l -v" lists your distro names.)
+
+
+3. WAYS OF RUNNING
+------------------
+  flypilot\launch.cmd
+      Starts the sim and the camera view, then waits. Use it to look around.
+      Two windows open:
+        "MuJoCo : Drone scene with obstacles"   3D view. Left-drag rotates, right-drag pans,
+                                                scroll zooms.
+        "AI-deck camera"                        what the drone's camera sees (gray, 324x244)
+      To stop: close the MuJoCo window or press Ctrl-C.
+
+  flypilot\launch.cmd waypoints
+      Same as above, then flies the baseline route: take off to 0.5 m, fly a 1.0 x 0.8 m square
+      through open floor (the drone turns to face each leg first), and land where it started.
+      Takes about 25 s. The terminal prints one line per waypoint. After landing, everything
+      stays open until you close the MuJoCo window or press Ctrl-C.
+        Ctrl-C DURING the flight = safety stop: the drone lands where it is, then everything
+        shuts down. A second Ctrl-C while it is landing cuts the motors.
+
+  flypilot\launch.cmd --no-camera waypoints
+      The same flight without the camera window (slightly lighter on slow PCs).
+
+  The individual pieces. Each one keeps its terminal busy, so you need one terminal per piece.
+  launch.cmd does all of this in one terminal.
+      flypilot\run_sim.cmd     only the sim (3D window). Its output goes to the terminal.
+      flypilot\camera.cmd      only the camera view. The sim must already be running.
+                               q or Esc quits; s saves a snapshot to flypilot\snapshots\.
+      flypilot\stop_sim.cmd    kills any leftover sim processes. Safe to run any time.
+      flypilot\setup.cmd       the one-time setup from section 2.
+
+  Logs
+      When started through launch.cmd, the sim and camera output go to flypilot\logs\sim.log
+      and flypilot\logs\camera.log. The simulated firmware's console is
+      ~/CrazySim/crazyflie-firmware/sitl_make/build/0/out.log inside WSL. In File Explorer that is
+      \\wsl.localhost\Ubuntu-24.04\home\<your linux user>\CrazySim\... (use your distro name).
+
+  Exit codes of the flight scripts: 0 = flew and landed, 1 = could not connect,
+  2 = safety stop happened.
+
+
+4. TESTS TO RUN ON A NEW PC (in this order)
+-------------------------------------------
+  [ ] 1. Setup.  flypilot\setup.cmd ends with "Setup finished".
+
+  [ ] 2. Sim + camera.  flypilot\launch.cmd
+         - The terminal prints "Graphics: D3D12 (<your GPU name>)". If it prints llvmpipe or a
+           "no GPU acceleration" warning, stop here and see section 5.
+         - 3D window: a gray room with brown pillars and green crates, and a small drone on the
+           floor in the middle.
+         - The bottom-right corner of the 3D window reads "RTF: 1.00x" (anything 0.97-1.03 is
+           fine). This is the most important number. RTF is how fast the sim runs compared to
+           real time. The firmware runs on the real clock, so below about 0.95 its timing breaks
+           and flights fail.
+         - Camera window: a gray view from the drone with a tall crate straight ahead. The
+           top-left corner reads "324x244  20.0 fps" (anything 18 or above is fine).
+         Close the 3D window; everything should shut down by itself.
+
+  [ ] 3. Flight.  flypilot\launch.cmd waypoints
+         Expected terminal output (your times will differ a little):
+           INFO    connecting to udp://127.0.0.1:19850
+           INFO    estimator converged at (0.00, 0.00, 0.02), yaw 0 deg
+           INFO    taking off to 0.50 m
+           INFO    waypoint 1/4 (1.0, 0.0) reached in 2.9 s; nearest obstacle 0.63 m (front)
+           INFO    waypoint 2/4 (1.0, -0.8) reached in 3.7 s; nearest obstacle 1.95 m (left)
+           INFO    waypoint 3/4 (0.0, -0.8) reached in 4.1 s; nearest obstacle 1.75 m (right)
+           INFO    waypoint 4/4 (0.0, 0.0) reached in 3.6 s; nearest obstacle 1.04 m (front)
+           INFO    landing at (0.00, 0.00)
+           INFO    landed
+           fly_waypoints.py finished with exit code 0.
+         In the 3D window the drone should fly level and smoothly. Any "SAFETY STOP" line means
+         the test failed. Note what it says and see section 5.
+
+  [ ] 4. Safety stop.  Run flypilot\launch.cmd waypoints again, and press Ctrl-C once while the
+         drone is flying. Expected: "SAFETY STOP: Ctrl-C. Landing now", the drone descends
+         straight down, then "landed", "Shutting down...", "Done." cmd may then ask
+         "Terminate batch job (Y/N)?"; answer Y.
+
+
+5. TROUBLESHOOTING
+------------------
+  No GPU: "no GPU acceleration" warning, RTF well below 1.00x, or flights drift/tumble
+     - Update your GPU driver from the NVIDIA / AMD / Intel website. WSL uses it through
+       DirectX 12.
+     - Then in PowerShell run "wsl --update" and "wsl --shutdown", and try again.
+     - Remote Desktop sessions and virtual machines usually have no GPU for WSL. Run on the PC
+       itself.
+
+  No windows appear at all
+     WSLg is missing or outdated. Run "wsl --update" (Windows 10 needs 21H2 or newer).
+
+  "not flying: no simulator answering" or "could not connect"
+     The sim isn't running or didn't finish starting. Use launch.cmd, which waits for it. Or run
+     flypilot\stop_sim.cmd and start again. Check flypilot\logs\sim.log for errors.
+
+  The camera window stays on "waiting for tcp://127.0.0.1:5050"
+     Either the sim is not running, or another camera viewer already has the stream: the sim's
+     camera bridge serves ONE viewer at a time, and a second one kicks the first off. Don't run
+     camera.cmd next to launch.cmd (launch.cmd already opens a camera view).
+
+  Lines like "QFontDatabase: Cannot find font directory" (when running camera.cmd directly)
+     Harmless. OpenCV's built-in Qt has no fonts bundled; the viewer doesn't need them.
+
+  setup.cmd fails partway (e.g. a download error)
+     Check your internet connection and run it again. It picks up where it left off.
+
+  Something is still running after a crash, or the 3D window is frozen
+     flypilot\stop_sim.cmd
+
+  Wrong WSL distro is used
+     Set FLYPILOT_DISTRO (section 2).
+
+
+6. WHAT WE CHANGED IN CRAZYSIM, AND WHY
+---------------------------------------
+  flypilot\patches\ holds two fixes that setup.cmd applies automatically to the pinned CrazySim
+  checkout. Your CrazySim code will therefore differ from upstream in exactly these places:
+
+  crazyflie-firmware\sitl-64bit-tick-stabilizer.patch
+     A one-line firmware bug fix. The simulated firmware uses 64-bit timer ticks, but the
+     stabilizer kept its wake-up time in a 32-bit variable, so FreeRTOS also read 4 bytes of
+     leftover stack memory. Whether that breaks anything depends on how the compiler lays out the
+     stack. With ours (GCC 13, Ubuntu 24.04) the stabilizer never sleeps, the firmware freezes at
+     "Wait for sensor calibration", and nothing can connect to it.
+
+  crazyflie-simulation\crazysim-wsl-realtime.patch
+     Makes the simulator keep real time under WSL:
+       - the 3D window's text overlay and the drone camera no longer block the physics loop
+       - the loop catches up after slow steps
+       - the mirror-like floor reflection is turned off. It looks cleaner, saves GPU time, and a
+         real drone camera would not see mirrored obstacles.
+
+
+7. NATIVE LINUX (Ubuntu) INSTEAD OF WINDOWS
+-------------------------------------------
+  From the repo folder:
+      sudo bash flypilot/system_deps.sh
+      bash flypilot/setup.sh
+      bash flypilot/py.sh launch.py               (sim + camera)
+      bash flypilot/py.sh launch.py waypoints     (sim + camera + flight)
+      bash flypilot/stop_sim.sh
+  Untested on native Linux so far; the steps are the same ones the .cmd files run inside WSL.
+
+
+Coming next: avoid_demo.py (the same flight stack, plus obstacle avoidance from the drone's
+range sensors) and a full README.md.

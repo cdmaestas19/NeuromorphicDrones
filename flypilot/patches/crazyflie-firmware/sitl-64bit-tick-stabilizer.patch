@@ -1,0 +1,16 @@
+diff --git a/src/modules/src/stabilizer.c b/src/modules/src/stabilizer.c
+index 23a38a8e..5ef6651e 100644
+--- a/src/modules/src/stabilizer.c
++++ b/src/modules/src/stabilizer.c
+@@ -275,7 +275,10 @@ static void controlMotors(const control_t* control) {
+ static void stabilizerTask(void* param)
+ {
+   stabilizerStep_t stabilizerStep;
+-  uint32_t lastWakeTime;
++  // TickType_t, not uint32_t: SITL's POSIX FreeRTOS port uses 64-bit ticks, and
++  // vTaskDelayUntil() reading 8 bytes from a 4-byte variable picks up stack garbage,
++  // never blocks, and starves every lower-priority task (sensors, CRTP link).
++  TickType_t lastWakeTime;
+   vTaskSetApplicationTaskTag(0, (void*)TASK_STABILIZER_ID_NBR);
+ 
+   //Wait for the system to be fully started to start stabilization loop

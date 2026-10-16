@@ -15,4 +15,5 @@ apt-get install -y --no-install-recommends \
     python3 python3-venv \
     libgl1 libegl1 libgl1-mesa-dri libglib2.0-0 \
     libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libxkbcommon-x11-0 \
+    libsm6 libice6 \
     mesa-utils
