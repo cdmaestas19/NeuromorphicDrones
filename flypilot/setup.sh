@@ -56,4 +56,4 @@ cmake ..  # the venv is active, so the build's bare `python` call resolves
 make -j"$(nproc)" cf2
 
 echo
-echo "Setup complete. Start the sim with run_sim.cmd (Windows) or 'bash run_sim.sh' (Linux)."
+echo "Setup complete. Next: launch.cmd (Windows) or 'bash py.sh launch.py' (Linux); see run.txt."

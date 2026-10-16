@@ -9,7 +9,7 @@ if defined FLYPILOT_DISTRO set "WSL=wsl.exe -d %FLYPILOT_DISTRO%"
 %WSL% -u root --cd "%~dp0." -- bash ./system_deps.sh || goto :fail
 %WSL% --cd "%~dp0." -- bash ./setup.sh || goto :fail
 echo.
-echo Setup finished. Next: run_sim.cmd
+echo Setup finished. Next: flypilot\launch.cmd (tests to run are in flypilot\run.txt)
 exit /b 0
 
 :fail
