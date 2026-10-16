@@ -1,0 +1,12 @@
+# Tested on Ubuntu 24.04 / Python 3.12 (WSL2) with CrazySim 3ec8b55.
+# Exact pins where behavior matters (radio link, physics); bounded ranges elsewhere so
+# Python 3.10 machines (Ubuntu 22.04) can still resolve. Install: pip install -r requirements.txt
+
+# PyPI cflib 0.1.34 includes the UDP driver CrazySim needs (identical to upstream master); no source install.
+cflib==0.1.34
+mujoco==3.16.0
+
+numpy>=1.24,<3
+opencv-python>=4.8,<6
+Jinja2>=3.0                    # firmware build tooling
+tomli>=2.0; python_version < "3.11"   # crazysim.py reads TOML params

@@ -1,0 +1,5 @@
+# Shell scripts run inside WSL/Linux and break with CRLF line endings.
+*.sh  text eol=lf
+# cmd.exe needs CRLF to parse labels reliably.
+*.cmd text eol=crlf
+*.bat text eol=crlf
