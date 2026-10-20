@@ -19,7 +19,8 @@ if ! git -C "$CRAZYSIM_DIR" cat-file -e "$CRAZYSIM_REF^{commit}" 2>/dev/null; th
 fi
 git -C "$CRAZYSIM_DIR" -c advice.detachedHead=false checkout --quiet "$CRAZYSIM_REF"
 # Local fixes live in patches/<submodule>/. Undo them so the pinned submodule checkout is clean,
-# then re-apply, which keeps this script safe to re-run.
+# then re-apply, which keeps this script safe to re-run. If an older version of a patch is applied
+# (it can't be reversed), the files the patch touches are restored to the pinned version instead.
 PATCH_TARGETS=(
     "crazyflie-firmware:$FIRMWARE_DIR"
     "crazyflie-simulation:$FIRMWARE_DIR/tools/crazyflie-simulation"
@@ -28,7 +29,15 @@ for t in "${PATCH_TARGETS[@]}"; do
     repo="${t#*:}"
     [ -e "$repo/.git" ] || continue
     for p in "$HERE/patches/${t%%:*}"/*.patch; do
-        git -C "$repo" apply --reverse --check "$p" 2>/dev/null && git -C "$repo" apply --reverse "$p"
+        if git -C "$repo" apply --reverse --check "$p" 2>/dev/null; then
+            git -C "$repo" apply --reverse "$p"
+        else
+            files=$(git -C "$repo" apply --numstat "$p" | cut -f3)
+            if ! git -C "$repo" diff --quiet -- $files; then
+                echo "   restoring $files (an older flypilot patch was applied)"
+                git -C "$repo" checkout -- $files
+            fi
+        fi
     done
 done
 # Only the firmware submodule is needed; crazyswarm2 (ROS 2) is skipped.

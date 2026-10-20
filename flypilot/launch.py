@@ -1,11 +1,20 @@
-"""One command for the whole stack: start the sim, open the camera view, and optionally fly.
+"""One command for the whole stack: start the sim, optionally fly, all shown in the MuJoCo window.
 
-    launch.cmd               sim + camera window
-    launch.cmd waypoints     sim + camera window, then fly the baseline waypoint route
-    launch.cmd --no-camera waypoints
+    launch.cmd                          sim only (drone camera inset top-left of the 3D view)
+    launch.cmd waypoints                ... then fly the baseline waypoint route
+    launch.cmd avoid                    ... with the avoidance dashboard on the right of the 3D view and
+                                        the Stops window, then the avoidance demo
+    launch.cmd avoid --route square     (options after the flight name go to the flight script)
+    launch.cmd deliver                  the same with no stops yet: add them in the Stops window (or
+                                        double-click the floor) (avoid_demo.py --route live)
+    launch.cmd avoid --route crossing   a route in the street scene (people, a cart): the sim starts on
+                                        the scene the route asks for; deliver takes --scene street
+Every flight follows paths planned on a map (planner.py).
+    launch.cmd --camera-window [waypoints]   also open the separate camera_view window (checks the
+                                        AI-deck stream's fps; not with avoid/deliver, which read the stream)
 
 Ctrl-C during a flight lands the drone and then shuts everything down. Otherwise, closing the MuJoCo
-window or pressing Ctrl-C shuts everything down. Sim and camera output go to flypilot/logs/.
+window or pressing Ctrl-C shuts everything down. Sim, camera and dashboard output go to flypilot/logs/.
 """
 import argparse
 import os
@@ -16,17 +25,38 @@ import time
 from pathlib import Path
 
 from flight import SIM_URI, sim_is_up
+from planner import SCENES
+from routes import ROUTES
 
 HERE = Path(__file__).resolve().parent
 LOG_DIR = HERE / 'logs'
-FLIGHTS = {'waypoints': 'fly_waypoints.py'}
+# flight name -> (script, dashboard.py args (None: no dashboard), default script args)
+FLIGHTS = {
+    'waypoints': ('fly_waypoints.py', None, []),
+    'avoid': ('avoid_demo.py', ['--stops'], []),
+    'deliver': ('avoid_demo.py', ['--stops'], ['--route', 'live']),
+}
 
 
-def start(name: str, cmd: list[str]) -> subprocess.Popen:
+def start(name: str, cmd: list[str], env: dict | None = None) -> subprocess.Popen:
     """Start a background process in its own session, so terminal Ctrl-C never reaches it."""
     LOG_DIR.mkdir(exist_ok=True)
     out = open(LOG_DIR / f'{name}.log', 'w')
-    return subprocess.Popen(cmd, cwd=HERE, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    return subprocess.Popen(cmd, cwd=HERE, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
+                            env=None if env is None else {**os.environ, **env})
+
+
+def scene_for(script: str | None, script_args: list[str]) -> str:
+    """The scene the flight runs in: its route's (routes.py), or --scene for live stops."""
+    if script != 'avoid_demo.py':
+        return 'obstacles'
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument('--route', default='blocked')  # avoid_demo.py's default
+    p.add_argument('--scene', default='obstacles')
+    ns, _ = p.parse_known_args(script_args)
+    route = ROUTES.get(ns.route)
+    name = route.scene if route else ns.scene
+    return name if name in SCENES else 'obstacles'  # avoid_demo.py reports a bad name itself
 
 
 def stop(proc: subprocess.Popen, timeout: float = 5.0):
@@ -92,7 +122,7 @@ def wait_for_camera(camera: subprocess.Popen, timeout: float = 20.0):
         time.sleep(0.2)
 
 
-def run_flight(script: str, sim: subprocess.Popen) -> bool:
+def run_flight(script: str, script_args: list[str], sim: subprocess.Popen) -> bool:
     """Run a flight script in the foreground; returns True if the user pressed Ctrl-C during it."""
     interrupted = False
 
@@ -102,10 +132,12 @@ def run_flight(script: str, sim: subprocess.Popen) -> bool:
 
     previous = signal.signal(signal.SIGINT, on_sigint)
     try:
-        flight = subprocess.Popen([sys.executable, script], cwd=HERE)
+        flight = subprocess.Popen([sys.executable, script, *script_args], cwd=HERE)
+        sim_closed = False
         while flight.poll() is None:
-            if sim.poll() is not None:
+            if not sim_closed and sim.poll() is not None:
                 print('The sim closed during the flight.', flush=True)
+                sim_closed = True
             time.sleep(0.2)
     finally:
         signal.signal(signal.SIGINT, previous)
@@ -116,21 +148,39 @@ def run_flight(script: str, sim: subprocess.Popen) -> bool:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('flight', nargs='?', choices=sorted(FLIGHTS), help='flight to run once the sim is up')
-    ap.add_argument('--no-camera', action='store_true', help="don't open the camera window")
-    args = ap.parse_args()
+    ap.add_argument('--camera-window', action='store_true',
+                    help='also open the separate camera view window (its fps readout checks the AI-deck stream)')
+    args, script_args = ap.parse_known_args()
+    if script_args and not args.flight:
+        ap.error(f'unrecognized arguments: {" ".join(script_args)}')
+    script, dashboard, default_args = FLIGHTS[args.flight] if args.flight else (None, None, [])
+    script_args = default_args + script_args
+    if args.camera_window and dashboard is not None:
+        ap.error(f'--camera-window cannot be combined with {args.flight}: the camera bridge serves one client, '
+                 'and the avoidance demo needs it')
 
     check_gpu()
+    # Closing the terminal (SIGHUP) or being killed (SIGTERM) must clean up like Ctrl-C does: the sim
+    # and viewers run in their own sessions, so nothing else would stop them.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, _interrupt)
+    stop_leftovers()
     procs = []
     try:
-        sim = start('sim', ['bash', 'run_sim.sh'])
+        scene = scene_for(script, script_args)
+        if scene != 'obstacles':
+            print(f'Scene: {scene} ({SCENES[scene].name})', flush=True)
+        sim = start('sim', ['bash', 'run_sim.sh'], env={'SCENE': str(SCENES[scene])})
         procs.append(sim)
         wait_for_sim(sim)
-        if not args.no_camera:
+        if dashboard is not None:
+            procs.append(start('dashboard', [sys.executable, 'dashboard.py', *dashboard, '--scene', str(SCENES[scene])]))
+        if args.camera_window:
             camera = start('camera', [sys.executable, 'camera_view.py'])
             procs.append(camera)
             if args.flight:
                 wait_for_camera(camera)
-        if args.flight and run_flight(FLIGHTS[args.flight], sim):
+        if script and run_flight(script, script_args, sim):
             return
         print('Running. Close the MuJoCo window or press Ctrl-C to shut everything down.', flush=True)
         while sim.poll() is None:
@@ -141,8 +191,17 @@ def main():
         print('Shutting down...', flush=True)
         for proc in reversed(procs):
             stop(proc)
-        subprocess.run(['bash', 'stop_sim.sh'], cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stop_leftovers()
         print('Done.', flush=True)
+
+
+def _interrupt(_sig, _frame):
+    raise KeyboardInterrupt
+
+
+def stop_leftovers():
+    """Kill sim processes and viewers from an earlier run that didn't shut down cleanly."""
+    subprocess.run(['bash', 'stop_sim.sh'], cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == '__main__':

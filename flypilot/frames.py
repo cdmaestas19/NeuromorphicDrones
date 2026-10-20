@@ -78,6 +78,14 @@ class FrameSource:
             self.frame_time = self._stamp
             return self._frame
 
+    def latest(self) -> np.ndarray | None:
+        """Newest frame without waiting (possibly the same one as last call); None before the first.
+
+        For control loops that run at their own rate and just want the freshest view.
+        """
+        with self._cond:
+            return self._frame
+
     def _run(self):
         while self._running:
             try:

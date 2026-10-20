@@ -52,6 +52,9 @@ class State:
     y: float = 0.0
     z: float = 0.0
     yaw: float = 0.0      # degrees, 0 = +x, counter-clockwise positive
+    vx: float = 0.0       # world-frame velocity [m/s]
+    vy: float = 0.0
+    vz: float = 0.0
     supervisor: int = 0
     ranges: dict = field(default_factory=lambda: {d: math.inf for d in RANGE_DIRECTIONS})
     stamp: float = 0.0    # time.monotonic() of the last pose update
@@ -59,6 +62,10 @@ class State:
     @property
     def position(self) -> np.ndarray:
         return np.array([self.x, self.y, self.z])
+
+    @property
+    def velocity(self) -> np.ndarray:
+        return np.array([self.vx, self.vy, self.vz])
 
 
 def wrap_deg(angle: float) -> float:
@@ -79,19 +86,23 @@ def sim_is_up(uri: str = SIM_URI, timeout: float = 0.3) -> bool:
 
 
 class Telemetry:
-    """Streams pose, supervisor state and Multi-ranger distances from the drone at 20 Hz."""
+    """Streams pose, velocity, supervisor state and Multi-ranger distances from the drone at 20 Hz."""
 
     def __init__(self, cf: Crazyflie):
         self._lock = threading.Lock()
         self._state = State()
+        # Three log blocks: each CRTP log packet carries at most 26 bytes of variables.
         pose = LogConfig('flypilot_pose', period_in_ms=TELEMETRY_PERIOD_MS)
         for var in ('stateEstimate.x', 'stateEstimate.y', 'stateEstimate.z', 'stateEstimate.yaw'):
             pose.add_variable(var, 'float')
         pose.add_variable('supervisor.info', 'uint16_t')
+        velocity = LogConfig('flypilot_velocity', period_in_ms=TELEMETRY_PERIOD_MS)
+        for var in ('stateEstimate.vx', 'stateEstimate.vy', 'stateEstimate.vz'):
+            velocity.add_variable(var, 'float')
         ranges = LogConfig('flypilot_ranges', period_in_ms=TELEMETRY_PERIOD_MS)
         for d in RANGE_DIRECTIONS:
             ranges.add_variable(f'range.{d}', 'uint16_t')
-        for config, callback in ((pose, self._on_pose), (ranges, self._on_ranges)):
+        for config, callback in ((pose, self._on_pose), (velocity, self._on_velocity), (ranges, self._on_ranges)):
             cf.log.add_config(config)
             config.data_received_cb.add_callback(callback)
             config.start()
@@ -107,6 +118,11 @@ class Telemetry:
             s.yaw = data['stateEstimate.yaw']
             s.supervisor = data['supervisor.info']
             s.stamp = time.monotonic()
+
+    def _on_velocity(self, _timestamp, data, _config):
+        with self._lock:
+            s = self._state
+            s.vx, s.vy, s.vz = data['stateEstimate.vx'], data['stateEstimate.vy'], data['stateEstimate.vz']
 
     def _on_ranges(self, _timestamp, data, _config):
         with self._lock:
@@ -216,7 +232,8 @@ class Pilot:
     """Streams position setpoints at a fixed rate and moves them smoothly toward goals.
 
     Every control tick runs the safety checks (link, telemetry freshness, supervisor, geofence) and
-    raises SafetyStop when one fails.
+    raises SafetyStop when one fails. `on_tick`, if set, is called after every tick (e.g. to feed a
+    dashboard), including during takeoff, turns and landing.
     """
 
     def __init__(self, link: Link, rate_hz: float = 20.0):
@@ -225,6 +242,7 @@ class Pilot:
         self.tm = link.telemetry
         self.dt = 1.0 / rate_hz
         self.flying = False
+        self.on_tick: Callable[[], None] | None = None
         s = self.tm.state()
         self.setpoint = [s.x, s.y, s.z, s.yaw]  # x, y, z [m], yaw [deg]
         self._next_tick = time.monotonic()
@@ -281,6 +299,25 @@ class Pilot:
         while time.monotonic() < t_end:
             self.tick()
 
+    def step_velocity(self, velocity, yaw_deg: float | None = None, yaw_rate: float = 90.0):
+        """One tick in velocity mode: move the setpoint by velocity * dt (world frame, m/s) and turn
+        toward yaw_deg (None holds the heading). The setpoint stays leashed to the drone."""
+        pos = self.tm.state().position
+        step = np.array(self.setpoint[:3]) + np.asarray(velocity, float) * self.dt
+        if np.linalg.norm(step - pos) <= LEASH_M:
+            self.setpoint[:3] = step.tolist()
+        if yaw_deg is not None:
+            err = wrap_deg(yaw_deg - self.setpoint[3])
+            limit = yaw_rate * self.dt
+            self.setpoint[3] = wrap_deg(self.setpoint[3] + max(-limit, min(limit, err)))
+        self.tick()
+
+    def hold_position(self):
+        """Pull the setpoint back to where the drone is now, so it stops instead of finishing the
+        lead the setpoint had over it."""
+        s = self.tm.state()
+        self.setpoint[:3] = [s.x, s.y, self.setpoint[2]]
+
     def land(self, speed: float = 0.25):
         log.info('landing at (%.2f, %.2f)', self.setpoint[0], self.setpoint[1])
         while self.setpoint[2] > 0.05:
@@ -304,6 +341,12 @@ class Pilot:
         self._check_safety()
         x, y, z, yaw = self.setpoint
         self.cf.commander.send_position_setpoint(x, y, z, yaw)
+        if self.on_tick is not None:
+            try:
+                self.on_tick()
+            except Exception:
+                log.exception('on_tick hook failed; disabling it')
+                self.on_tick = None
         self._next_tick += self.dt
         delay = self._next_tick - time.monotonic()
         if delay > 0:

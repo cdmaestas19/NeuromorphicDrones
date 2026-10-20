@@ -1,8 +1,46 @@
 diff --git a/simulator_files/mujoco/crazysim.py b/simulator_files/mujoco/crazysim.py
-index d4a7eb9..202fbea 100644
+index d4a7eb9..85d789d 100644
 --- a/simulator_files/mujoco/crazysim.py
 +++ b/simulator_files/mujoco/crazysim.py
-@@ -414,6 +414,12 @@ class CameraRenderer:
+@@ -56,6 +56,7 @@ Multi-agent usage:
+ """
+ 
+ import argparse
++import json
+ import math
+ import os
+ import queue
+@@ -70,6 +71,11 @@ import mujoco
+ import mujoco.viewer
+ import numpy as np
+ 
++try:
++    import cv2  # optional: smoother scaling of the viewer's side panel
++except ImportError:
++    cv2 = None
++
+ # ---------------------------------------------------------------------------
+ # CRTP constants (CrtpUtils.h)
+ # ---------------------------------------------------------------------------
+@@ -112,6 +118,17 @@ TOF_RATE_HZ   = 40         # VL53L1x ToF update rate (flowdeck)
+ FLOW_NPIX     = 30.0       # PMW3901 pixel count
+ FLOW_THETAPIX = 4.2 * math.pi / 180.0  # FOV per pixel [rad]
+ CFLIB_PORT_OFFSET = -100   # cflib port = firmware port + offset (19950 → 19850)
++RANGE_FAN_DEG = 10.0       # each horizontal range sensor: rays at -10, 0, +10 deg about its axis
++
++
++def _range_fan(axis_deg: float) -> tuple:
++    return tuple(np.array([math.cos(math.radians(axis_deg + a)), math.sin(math.radians(axis_deg + a)), 0.0])
++                 for a in (-RANGE_FAN_DEG, 0.0, RANGE_FAN_DEG))
++
++
++# Body-frame ray directions per Multi-ranger sensor: front=+X, back=-X, left=+Y, right=-Y, up=+Z
++_RANGE_FANS = (_range_fan(0.0), _range_fan(180.0), _range_fan(90.0), _range_fan(-90.0),
++               (np.array([0.0, 0.0, 1.0]),))
+ 
+ # ---------------------------------------------------------------------------
+ # Per-model motor parameters — loaded from drone-models submodule params.toml
+@@ -414,6 +431,12 @@ class CameraRenderer:
  
      Frames are split into numbered UDP chunks so they fit in datagrams.
      Chunk format: [seq:u16][total:u16][width:u16][height:u16][data]
@@ -15,7 +53,7 @@ index d4a7eb9..202fbea 100644
      """
  
      def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
-@@ -424,7 +430,8 @@ class CameraRenderer:
+@@ -424,7 +447,8 @@ class CameraRenderer:
                                            self._cam_name)
          if self._cam_id < 0:
              raise ValueError(f'Camera {self._cam_name!r} not found in model')
@@ -25,13 +63,15 @@ index d4a7eb9..202fbea 100644
          self._width = width
          self._height = height
          self._frame_period = 1.0 / fps
-@@ -436,15 +443,38 @@ class CameraRenderer:
+@@ -436,16 +460,42 @@ class CameraRenderer:
          print(f'[crazysim] Agent {agent_id}: camera frames → '
                f'udp://127.0.0.1:{self._port}')
  
 +        self._busy = threading.Event()     # set while the worker owns _snapshot
 +        self._frame_due = threading.Event()
 +        self._pending = False              # a frame is due but the worker was busy
++        self.latest_gray = None            # newest frame, for the viewer's camera inset
++        self.frames_rendered = 0
 +        self._running = True
 +        threading.Thread(target=self._render_loop, daemon=True).start()
 +
@@ -66,9 +106,11 @@ index d4a7eb9..202fbea 100644
 -        pixels = self._renderer.render()
 +    def _send(self, pixels: np.ndarray):
          gray = np.dot(pixels[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
++        self.latest_gray, self.frames_rendered = gray, self.frames_rendered + 1
          img_bytes = gray.tobytes()
  
-@@ -460,6 +490,7 @@ class CameraRenderer:
+         # Split into UDP chunks
+@@ -460,9 +510,301 @@ class CameraRenderer:
                  pass
  
      def stop(self):
@@ -76,7 +118,357 @@ index d4a7eb9..202fbea 100644
          self._sock.close()
  
  
-@@ -1231,6 +1262,10 @@ class CrazySimMuJoCo:
++# ---------------------------------------------------------------------------
++# Viewer overlays: RTF readout, FPV camera inset, and a side panel from another process
++# ---------------------------------------------------------------------------
++OVERLAY_PANEL_PATH = os.environ.get('CRAZYSIM_OVERLAY', '/dev/shm/crazysim_overlay.rgb')
++OVERLAY_PANEL_STALE_S = 3.0     # ignore a panel file that stopped being refreshed
++OVERLAY_PANEL_MAX_WIDTH = 0.45  # fraction of the window the panel may cover
++OVERLAY_MAX_HZ = 10.0           # each update copies ~1 MB in Python; keep it light next to the physics loop
++
++
++class ViewerOverlay:
++    """Draws on top of the passive viewer, from its own thread: set_texts()/set_images() block until
++    the viewer renders a frame (they release the GIL while waiting), so they stay off the physics loop.
++
++      - RTF readout, bottom-left
++      - agent 0's FPV camera image, top-left, when --camera is on
++      - a side panel, right edge, that another process writes to OVERLAY_PANEL_PATH as
++        b'CSO1' + width:u16 + height:u16 + RGB bytes (replaced atomically). Absent or stale = hidden.
++    """
++
++    def __init__(self, viewer, running, rtf, sim_time, camera, picker=None):
++        self._v, self._running, self._rtf, self._sim_time, self._camera = viewer, running, rtf, sim_time, camera
++        self._picker = picker
++        self._panel = self._panel_mtime = self._fitted = None
++        self._fitted_key = self._shown_key = None
++
++    def run(self):
++        last_text = 0.0
++        while self._running():
++            t0 = time.monotonic()
++            if t0 - last_text >= 0.5:
++                self._v.set_texts((mujoco.mjtFontScale.mjFONTSCALE_150, mujoco.mjtGridPos.mjGRID_BOTTOMLEFT,
++                                   f'RTF: {self._rtf():.2f}x', f't={self._sim_time():.1f}s'))
++                last_text = t0
++            if self._picker is not None:
++                self._picker.poll()
++            self._update_images()
++            time.sleep(max(0.0, 1.0 / OVERLAY_MAX_HZ - (time.monotonic() - t0)))
++
++    def _update_images(self):
++        vp = self._v.viewport
++        if vp is None or vp.width <= 0 or vp.height <= 0:
++            return
++        cam = self._camera.latest_gray if self._camera is not None else None
++        panel = self._read_panel()
++        key = (self._camera.frames_rendered if cam is not None else None, self._panel_mtime if panel is not None else None,
++               vp.width, vp.height)
++        if key == self._shown_key:
++            return
++        self._shown_key = key
++        images = []
++        if cam is not None and cam.shape[0] + 20 < vp.height and cam.shape[1] + 20 < vp.width:
++            h, w = cam.shape
++            images.append((mujoco.MjrRect(10, vp.height - h - 10, w, h), np.repeat(cam[:, :, None], 3, axis=2)))
++        if panel is not None:
++            fitted = self._fit(panel, vp)
++            images.append((mujoco.MjrRect(vp.width - fitted.shape[1], 0, fitted.shape[1], fitted.shape[0]), fitted))
++        if images:
++            self._v.set_images(images)
++        else:
++            self._v.clear_images()
++
++    def _read_panel(self):
++        try:
++            st = os.stat(OVERLAY_PANEL_PATH)
++        except OSError:
++            return None
++        if time.time() - st.st_mtime > OVERLAY_PANEL_STALE_S:
++            return None
++        if st.st_mtime_ns != self._panel_mtime:
++            try:
++                with open(OVERLAY_PANEL_PATH, 'rb') as f:
++                    data = f.read()
++                magic, w, h = struct.unpack_from('<4sHH', data)
++                if magic == b'CSO1' and len(data) == 8 + w * h * 3:
++                    self._panel = np.frombuffer(data, np.uint8, offset=8).reshape(h, w, 3)
++                    self._panel_mtime = st.st_mtime_ns
++            except (OSError, struct.error, ValueError):
++                pass
++        return self._panel
++
++    def _fit(self, panel, vp):
++        ph, pw = panel.shape[:2]
++        scale = min(vp.height / ph, OVERLAY_PANEL_MAX_WIDTH * vp.width / pw)
++        size = (max(1, int(pw * scale)), max(1, int(ph * scale)))
++        key = (self._panel_mtime, size)
++        if key != self._fitted_key:
++            if size == (pw, ph):
++                self._fitted = panel
++            elif cv2 is not None:
++                self._fitted = cv2.resize(panel, size, interpolation=cv2.INTER_AREA)
++            else:
++                rows = np.linspace(0, ph - 1, size[1]).astype(int)
++                cols = np.linspace(0, pw - 1, size[0]).astype(int)
++                self._fitted = panel[rows][:, cols]
++            self._fitted_key = key
++        return self._fitted
++
++
++# ---------------------------------------------------------------------------
++# Viewer picking: double-clicked points go to another process, which sends back markers to draw
++# ---------------------------------------------------------------------------
++PICK_PORT = int(os.environ.get('CRAZYSIM_PICK_PORT', '5310'))      # clicked points are sent here
++MARKER_PORT = int(os.environ.get('CRAZYSIM_MARKER_PORT', '5311'))  # markers to draw arrive here
++MARKER_STALE_S = 3.0           # remove markers whose sender stopped refreshing them
++_PICK_TAKEN = (0.0, 0.0, -1.0e6)  # written into perturb.localpos once a click has been forwarded
++
++
++class ViewerPicker:
++    """Lets another process take points from the 3D view and draw markers into it (polled by
++    ViewerOverlay's thread).
++
++    A left double-click on static scenery (floor, walls, crates: all world-body geoms) makes the viewer
++    set perturb.select = 0 and perturb.localpos = the clicked point in world coordinates. Each new
++    point is sent to udp://127.0.0.1:PICK_PORT as {"cmd": "pick", "x": .., "y": .., "z": .., "eye": [..]},
++    eye being the camera position (the click ray runs from eye to the point).
++    Double-clicks on bodies (the drone) keep their usual meaning and are not sent.
++
++    Markers arrive on udp://127.0.0.1:MARKER_PORT as {"markers": [...]}, each one of
++      {"kind": "sphere" | "disc", "pos": [x, y, z], "size": radius, "rgba": [r, g, b, a], "label": ".."}
++      {"kind": "line", "from": [x, y, z], "to": [x, y, z], "width": pixels, "rgba": [r, g, b, a]}
++    They are drawn into the viewer's user scene only: not part of the model, so neither the drone's
++    camera nor its range sensors see them.
++    """
++
++    def __init__(self, viewer):
++        self._v = viewer
++        self._out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        self._in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        self._in.setblocking(False)
++        try:
++            self._in.bind(('127.0.0.1', MARKER_PORT))
++        except OSError as e:
++            print(f'[crazysim] viewer markers off: udp port {MARKER_PORT} is busy ({e})')
++            self._in = None
++        self._last_pos = None
++        self._markers_raw, self._markers_t = None, 0.0
++
++    def poll(self):
++        self._forward_pick()
++        self._take_markers()
++
++    def _forward_pick(self):
++        pert, cam = self._v.perturb, self._v.cam
++        with self._v.lock():
++            pos = tuple(float(c) for c in pert.localpos)
++            new = (pert.select == 0 and self._last_pos is not None and pos != self._last_pos
++                   and pos != _PICK_TAKEN)
++            if new:
++                pert.localpos[:] = _PICK_TAKEN  # so a second click on the same spot is new too
++                eye = _camera_eye(cam)
++            self._last_pos = _PICK_TAKEN if new else pos
++        if new:
++            msg = {'cmd': 'pick', 'x': pos[0], 'y': pos[1], 'z': pos[2]}
++            if eye is not None:
++                msg['eye'] = eye  # the click ray runs from here to the point: it may pass through a marker
++            try:
++                self._out.sendto(json.dumps(msg).encode(), ('127.0.0.1', PICK_PORT))
++            except OSError:
++                pass
++
++    def _take_markers(self):
++        raw = None
++        while self._in is not None:
++            try:
++                raw = self._in.recv(65535)
++            except OSError:  # nothing more queued
++                break
++        now = time.monotonic()
++        if raw is not None:
++            self._markers_t = now
++            if raw != self._markers_raw:
++                try:
++                    markers = json.loads(raw)['markers']
++                except (ValueError, KeyError, TypeError):
++                    return
++                self._markers_raw = raw
++                self._draw(markers)
++        elif self._markers_raw is not None and now - self._markers_t > MARKER_STALE_S:
++            self._markers_raw = None
++            self._draw([])
++
++    def _draw(self, markers):
++        scn = self._v.user_scn
++        with self._v.lock():
++            scn.ngeom = 0
++            for mk in markers:
++                if scn.ngeom >= scn.maxgeom:
++                    break
++                try:
++                    _marker_geom(scn.geoms[scn.ngeom], mk)
++                except (KeyError, TypeError, ValueError):
++                    continue
++                scn.ngeom += 1
++
++
++# ---------------------------------------------------------------------------
++# Movers: scene bodies (people, carts) that another process moves
++# ---------------------------------------------------------------------------
++MOVER_PORT = int(os.environ.get('CRAZYSIM_MOVER_PORT', '5312'))
++MOVER_STALE_S = 0.5  # a mover whose commands stop for this long stands still
++
++
++class MoverDriver:
++    """Moves the scene's mocap bodies (a person, a cart, ...) as another process commands.
++
++    Commands arrive on udp://127.0.0.1:MOVER_PORT as
++        {"movers": {"<body name>": {"p": [x, y, z], "v": [vx, vy, vz], "yaw": degrees}, ...}}
++    Between commands each mover keeps its last velocity, so the motion is smooth at the physics rate
++    even though commands come at ~20 Hz; one whose commands stop for MOVER_STALE_S stands still.
++    Mocap bodies are kinematic: they push the drone on contact but nothing pushes them. The range
++    sensors and the camera see them like any other geometry.
++    """
++
++    def __init__(self, model: mujoco.MjModel):
++        self._ids = {model.body(b).name: int(model.body_mocapid[b])
++                     for b in range(model.nbody) if model.body_mocapid[b] >= 0}
++        self._cmd = {}  # mocap id -> (t, (x, y, z), (vx, vy, vz))
++        self._yaw = {}  # mocap id -> pending quaternion
++        self._sock, self._next_poll = None, 0.0
++        if not self._ids:
++            return
++        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        try:
++            self._sock.bind(('127.0.0.1', MOVER_PORT))
++            self._sock.setblocking(False)
++            print(f'[crazysim] movers {sorted(self._ids)}: commands on udp://127.0.0.1:{MOVER_PORT}')
++        except OSError as e:
++            print(f'[crazysim] movers off: udp port {MOVER_PORT} is busy ({e})')
++            self._sock = None
++
++    def apply(self, data: mujoco.MjData):
++        """Once per physics step, before mj_step."""
++        if self._sock is None:
++            return
++        now = time.perf_counter()
++        if now >= self._next_poll:
++            self._poll(now)
++            self._next_poll = now + 0.01
++            for mid, quat in self._yaw.items():
++                data.mocap_quat[mid] = quat
++            self._yaw.clear()
++        for mid, (t, p, v) in self._cmd.items():
++            dt = min(now - t, MOVER_STALE_S)
++            data.mocap_pos[mid] = (p[0] + v[0] * dt, p[1] + v[1] * dt, p[2] + v[2] * dt)
++
++    def _poll(self, now: float):
++        while True:
++            try:
++                raw = self._sock.recv(65535)
++            except OSError:  # nothing more queued
++                return
++            try:
++                for name, c in json.loads(raw)['movers'].items():
++                    mid = self._ids.get(name)
++                    if mid is None:
++                        continue
++                    self._cmd[mid] = (now, tuple(float(x) for x in c['p'][:3]),
++                                      tuple(float(x) for x in c.get('v', (0.0, 0.0, 0.0))[:3]))
++                    if 'yaw' in c:
++                        half = math.radians(float(c['yaw'])) / 2.0
++                        self._yaw[mid] = (math.cos(half), 0.0, 0.0, math.sin(half))
++            except (ValueError, KeyError, TypeError, AttributeError):
++                continue
++
++
++def _camera_eye(cam) -> list | None:
++    """World position of the viewer's free or tracking camera (as mjv_cameraFrame computes it)."""
++    if cam.type not in (mujoco.mjtCamera.mjCAMERA_FREE, mujoco.mjtCamera.mjCAMERA_TRACKING):
++        return None
++    az, el = math.radians(cam.azimuth), math.radians(cam.elevation)
++    forward = (math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el))
++    return [float(cam.lookat[i] - cam.distance * forward[i]) for i in range(3)]
++
++
++def _marker_geom(g, mk: dict):
++    rgba = np.array(mk.get('rgba', (1.0, 1.0, 1.0, 1.0)), dtype=np.float32)
++    kind = mk['kind']
++    if kind == 'line':
++        mujoco.mjv_initGeom(g, mujoco.mjtGeom.mjGEOM_LINE, np.zeros(3), np.zeros(3), np.eye(3).ravel(), rgba)
++        mujoco.mjv_connector(g, mujoco.mjtGeom.mjGEOM_LINE, float(mk.get('width', 2.0)),
++                             np.array(mk['from'], dtype=float), np.array(mk['to'], dtype=float))
++    elif kind in ('sphere', 'disc'):
++        r = float(mk['size'])
++        gtype, size = ((mujoco.mjtGeom.mjGEOM_SPHERE, [r, r, r]) if kind == 'sphere'
++                       else (mujoco.mjtGeom.mjGEOM_CYLINDER, [r, 0.002, 0.0]))  # disc: a flat cylinder
++        mujoco.mjv_initGeom(g, gtype, np.array(size), np.array(mk['pos'], dtype=float), np.eye(3).ravel(), rgba)
++    else:
++        raise ValueError(kind)
++    g.label = str(mk.get('label', ''))[:99]
++
++
+ # ---------------------------------------------------------------------------
+ # Directory containing this script — used to resolve scene.xml
+ _HERE = os.path.dirname(os.path.abspath(__file__))
+@@ -985,35 +1327,31 @@ class DroneAgent:
+         return pos, q_xyzw
+ 
+     def read_ranges(self) -> tuple[float, float, float, float, float]:
+-        """Cast 5 rays in body-frame directions, return distances [m] clamped to max range."""
++        """Distances [m] front, back, left, right, up, clamped to max range.
++
++        A VL53L1x sees a cone (~27 deg), not a line: each horizontal sensor casts a small horizontal fan
++        (RANGE_FAN_DEG either side of its axis) and reports the nearest hit, so the edge of a box or a
++        person beside the axis is not missed. The fan stays level, so it doesn't pick up the floor."""
+         bid = self._body_id
+         pos = self.data.xpos[bid]
+         R = self.data.xmat[bid].reshape(3, 3)
+ 
+-        # Body-frame directions: front=+X, back=-X, left=+Y, right=-Y, up=+Z
+-        directions_body = (
+-            np.array([1.0, 0.0, 0.0]),
+-            np.array([-1.0, 0.0, 0.0]),
+-            np.array([0.0, 1.0, 0.0]),
+-            np.array([0.0, -1.0, 0.0]),
+-            np.array([0.0, 0.0, 1.0]),
+-        )
+-
+         ranges = []
+-        for d_body in directions_body:
+-            d_world = R @ d_body
+-            geom_id = np.array([-1], dtype=np.int32)
+-            dist = mujoco.mj_ray(
+-                self.model, self.data,
+-                pos, d_world,
+-                self._ray_geomgroup,
+-                1,      # flg_static: include static geoms (floor, walls)
+-                bid,    # bodyexclude: skip drone's own body
+-                geom_id,
+-            )
+-            if dist < 0 or dist > RANGE_MAX_M:
+-                dist = RANGE_MAX_M
+-            ranges.append(dist)
++        geom_id = np.array([-1], dtype=np.int32)
++        for fan in _RANGE_FANS:
++            best = RANGE_MAX_M
++            for d_body in fan:
++                dist = mujoco.mj_ray(
++                    self.model, self.data,
++                    pos, R @ d_body,
++                    self._ray_geomgroup,
++                    1,      # flg_static: include static geoms (floor, walls)
++                    bid,    # bodyexclude: skip drone's own body
++                    geom_id,
++                )
++                if 0 <= dist < best:
++                    best = dist
++            ranges.append(best)
+ 
+         return tuple(ranges)
+ 
+@@ -1231,6 +1569,10 @@ class CrazySimMuJoCo:
          # Build shared MuJoCo model with all drones
          self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
          self.model.opt.timestep = self.dt
@@ -87,7 +479,23 @@ index d4a7eb9..202fbea 100644
          self.data = mujoco.MjData(self.model)
  
          # Create per-drone agents
-@@ -1334,14 +1369,42 @@ class CrazySimMuJoCo:
+@@ -1264,6 +1606,7 @@ class CrazySimMuJoCo:
+             )
+             self.agents.append(agent)
+ 
++        self._movers = MoverDriver(self.model)
+         self._running = False
+ 
+     def _apply_downwash(self):
+@@ -1314,6 +1657,7 @@ class CrazySimMuJoCo:
+                 agent.update_led_materials()
+             if self._downwash and self.num_agents > 1:
+                 self._apply_downwash()
++            self._movers.apply(self.data)
+             mujoco.mj_step(self.model, self.data)
+             for agent in self.agents:
+                 agent.send_sensor_data()
+@@ -1334,14 +1678,38 @@ class CrazySimMuJoCo:
                  _rtf_wall_start = wall_now
                  _rtf_sim_start = self.data.time
  
@@ -111,17 +519,13 @@ index d4a7eb9..202fbea 100644
                                                show_right_ui=False) as v:
 +                # set_texts() blocks until the viewer draws its next frame, which under
 +                # WSLg can take tens of ms; calling it from the physics loop throttled the
-+                # sim to a few % of real time. Update the overlay from its own thread.
-+                def _overlay_loop():
-+                    while v.is_running() and self._running:
-+                        v.set_texts((
-+                            mujoco.mjtFontScale.mjFONTSCALE_150,
-+                            mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
-+                            f'RTF: {_rtf_value:.2f}x',
-+                            f't={self.data.time:.1f}s',
-+                        ))
-+                        time.sleep(0.5)
-+                threading.Thread(target=_overlay_loop, daemon=True).start()
++                # sim to a few % of real time. Overlays are drawn from their own thread.
++                overlay = ViewerOverlay(
++                    v, running=lambda: v.is_running() and self._running,
++                    rtf=lambda: _rtf_value, sim_time=lambda: self.data.time,
++                    camera=self.agents[0]._camera if self.agents else None,
++                    picker=ViewerPicker(v))
++                threading.Thread(target=overlay.run, daemon=True).start()
 +
                  # Force initial camera: look from behind drone toward +X.
                  _cam_init_frames = 5
@@ -130,7 +534,7 @@ index d4a7eb9..202fbea 100644
                  while v.is_running() and self._running:
                      t0 = time.perf_counter()
                      with v.lock():
-@@ -1355,29 +1418,17 @@ class CrazySimMuJoCo:
+@@ -1355,29 +1723,17 @@ class CrazySimMuJoCo:
                              _cam_init_frames -= 1
                      _update_rtf()
                      if t0 - _last_render >= _render_interval:

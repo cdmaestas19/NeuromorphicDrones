@@ -4,7 +4,8 @@ FLY BRAIN PILOT - flypilot/ : HOW TO SET UP, RUN AND TEST
 What this is
   A simulated Crazyflie drone in CrazySim: MuJoCo physics plus the real Crazyflie firmware, a 3D
   window, the drone's own camera view, and Python flight scripts. This is milestone M3: ordinary
-  flight control only. There is no fly-brain code here yet.
+  flight control plus a geometric (range-sensor) avoidance demo. There is no fly-brain code here
+  yet. flypilot\README.md explains how it all fits together.
 
 You run everything from a normal Windows terminal (PowerShell, cmd, or the VS Code terminal). The
 .cmd files start everything inside WSL for you, so you never have to open WSL yourself. The
@@ -69,12 +70,16 @@ commands below assume your terminal is in the repo folder.
 
 3. WAYS OF RUNNING
 ------------------
+  Everything shows up in ONE window, "MuJoCo : Drone scene with obstacles":
+      - the 3D view. Left-drag rotates, right-drag pans, scroll zooms.
+      - top-left inset: what the drone's own camera sees (gray, 324x244, like the real AI-deck)
+      - bottom-left: "RTF: 1.00x" (see test 2)
+      - right side, during avoid and deliver runs: the avoidance dashboard (see section 4, test 5)
+  During avoid and deliver runs a second window, "Delivery stops", shows the map from above: the
+  stops, the planned route, people and the cart (magenta), and the buttons to add and remove stops.
+
   flypilot\launch.cmd
-      Starts the sim and the camera view, then waits. Use it to look around.
-      Two windows open:
-        "MuJoCo : Drone scene with obstacles"   3D view. Left-drag rotates, right-drag pans,
-                                                scroll zooms.
-        "AI-deck camera"                        what the drone's camera sees (gray, 324x244)
+      Starts the sim and waits. Use it to look around.
       To stop: close the MuJoCo window or press Ctrl-C.
 
   flypilot\launch.cmd waypoints
@@ -85,20 +90,96 @@ commands below assume your terminal is in the repo folder.
         Ctrl-C DURING the flight = safety stop: the drone lands where it is, then everything
         shuts down. A second Ctrl-C while it is landing cuts the motors.
 
-  flypilot\launch.cmd --no-camera waypoints
-      The same flight without the camera window (slightly lighter on slow PCs).
+  HOW EVERY FLIGHT FINDS ITS WAY
+      Every flight is a list of stops. Each leg follows a path planned on a MAP: the planner
+      routes around every obstacle on the map and keeps 0.3 m away from it. Whatever is NOT on the
+      map is the avoidance layer's job. When the avoidance dodges something, the drone re-plans
+      from where it ended up. Three maps:
+        all        every obstacle is mapped (deliver's default; square; waypoints)
+        building   walls, pillars, partitions, but not the crates: the avoidance has to handle
+                   them (the "blocked" test)
+        none       nothing mapped, straight lines: the avoidance alone (limit testing)
+      New tests go in flypilot\routes.py as stops plus a map.
+
+  flypilot\launch.cmd avoid
+      The avoidance demo: the "blocked" route on the "building" map, so its first leg runs
+      straight at crate3, which the planner doesn't know about. Uses the geometric avoidance
+      policy. The avoidance dashboard is on the right of the 3D view, and the "Delivery stops"
+      window opens next to it. The drone sidesteps the crate, passes it, visits the other two
+      stops, and lands back home. About 50 s. Ctrl-C works the same as above.
+
+  flypilot\launch.cmd avoid --route square
+      The avoidance demo on the clear square route, everything mapped. Avoidance should never
+      trigger: this is the false-alarm test.
+
+  flypilot\launch.cmd deliver
+      No stops yet: YOU pick where the drone goes, like a customer ordering a delivery. The
+      drone takes off and hovers over a blue "H" (home). In the "Delivery stops" window:
+        left-click the map              adds a stop (an orange numbered marker). The drone
+                                        flies to the stops in order on planned paths, hovers 1 s
+                                        at each (the drop-off), and the marker turns green.
+        click a stop, or its X          removes it; a stop not yet done is cancelled, even while
+                                        the drone is on its way
+        Go home (or click H)            return home and land once the queued stops are done
+                                        (press again to undo)
+        Cancel open stops / Clear finished    empty the queue / tidy away finished stops
+        Path planner knows: all / building / none    switch the map (it re-plans at once)
+      A ring follows the mouse over the map: green = a stop is allowed there, red = refused (too
+      close to an obstacle or wall, or outside the room). Double-clicking in the 3D view works the
+      same way. With nothing queued, the drone just hovers and waits. The markers exist only in
+      the 3D view: the drone's camera and range sensors never see them. Ctrl-C lands the drone
+      where it is.
+
+  flypilot\launch.cmd deliver --at 2.5,0 --at 2.5,-0.9 --at 0,-0.9 --return --map building
+      The same with the stops given up front (x,y in metres; the drone starts at 0,0), for
+      repeatable tests. --return = come home and land after the last stop instead of waiting
+      for more. --map picks the map (also works with avoid). You can still add stops in the
+      window.
+
+  MOVING OBSTACLES: PEOPLE AND A CART
+      These run in the "street" scene: the same room with a walkway across it (light) and a road
+      down it (dark, dashed yellow line), two people and a cart. The window is then titled "MuJoCo
+      : Street scene with people and a cart". The people and the cart follow scripted paths, timed
+      so the encounter happens in the same place every run. They are never on the planner's map,
+      so dodging them is the avoidance's job. At the end the terminal prints the closest approach
+      to each of them and any contacts.
+        flypilot\launch.cmd avoid --route headon     a person walks along the walkway at the drone
+        flypilot\launch.cmd avoid --route hover      a person walks up behind the hovering drone
+        flypilot\launch.cmd avoid --route crossing   a person crosses the drone's path from the side
+        flypilot\launch.cmd avoid --route cart       the cart drives down the road across its path
+        flypilot\launch.cmd deliver --scene street   your own stops while the person and the cart
+                                                     go back and forth the whole time
+      Today's geometric policy dodges headon and hover. It gets touched in crossing and cart,
+      because those come in between its four sensor directions. That is the comparison these
+      tests are for: a camera-based looming detector and the fly brain should do better there.
+
+  flypilot\launch.cmd avoid --record recordings\blocked.jsonl
+      Also saves every decision's inputs and outputs (one line per decision) to
+      flypilot\recordings\. Recordings are not committed to git.
+
+  flypilot\bench.cmd recordings\blocked.jsonl [--policy geometric]
+      No sim needed. Replays a recording through the policy and the supervisor, checks that the
+      decisions come out identical to the recording ("MATCH"), and reports what each decision
+      costs in microseconds. Use it after changing a policy (same decisions, lower cost?) and to
+      try new policies on recorded flights.
+
+  flypilot\launch.cmd --camera-window [waypoints]
+      Also opens the separate "AI-deck camera" window. It reads the same stream a real AI-deck
+      sends over WiFi and shows its fps, so it checks that path. Can't be combined with avoid or
+      deliver: the camera stream serves one client, and the avoidance demo uses it.
 
   The individual pieces. Each one keeps its terminal busy, so you need one terminal per piece.
   launch.cmd does all of this in one terminal.
       flypilot\run_sim.cmd     only the sim (3D window). Its output goes to the terminal.
-      flypilot\camera.cmd      only the camera view. The sim must already be running.
+      flypilot\camera.cmd      only the separate camera window. The sim must already be running.
                                q or Esc quits; s saves a snapshot to flypilot\snapshots\.
-      flypilot\stop_sim.cmd    kills any leftover sim processes. Safe to run any time.
+      flypilot\stop_sim.cmd    kills any leftover sim, dashboard or camera processes. Safe to run
+                               any time.
       flypilot\setup.cmd       the one-time setup from section 2.
 
   Logs
-      When started through launch.cmd, the sim and camera output go to flypilot\logs\sim.log
-      and flypilot\logs\camera.log. The simulated firmware's console is
+      When started through launch.cmd, the sim, dashboard and camera output go to
+      flypilot\logs\sim.log, dashboard.log and camera.log. The simulated firmware's console is
       ~/CrazySim/crazyflie-firmware/sitl_make/build/0/out.log inside WSL. In File Explorer that is
       \\wsl.localhost\Ubuntu-24.04\home\<your linux user>\CrazySim\... (use your distro name).
 
@@ -110,17 +191,18 @@ commands below assume your terminal is in the repo folder.
 -------------------------------------------
   [ ] 1. Setup.  flypilot\setup.cmd ends with "Setup finished".
 
-  [ ] 2. Sim + camera.  flypilot\launch.cmd
+  [ ] 2. Sim + camera.  flypilot\launch.cmd --camera-window
          - The terminal prints "Graphics: D3D12 (<your GPU name>)". If it prints llvmpipe or a
            "no GPU acceleration" warning, stop here and see section 5.
          - 3D window: a gray room with brown pillars and green crates, and a small drone on the
-           floor in the middle.
-         - The bottom-right corner of the 3D window reads "RTF: 1.00x" (anything 0.97-1.03 is
+           floor in the middle. Top-left inset: the drone's gray camera view, with a tall crate
+           straight ahead.
+         - The bottom-left corner of the 3D window reads "RTF: 1.00x" (anything 0.97-1.03 is
            fine). This is the most important number. RTF is how fast the sim runs compared to
            real time. The firmware runs on the real clock, so below about 0.95 its timing breaks
            and flights fail.
-         - Camera window: a gray view from the drone with a tall crate straight ahead. The
-           top-left corner reads "324x244  20.0 fps" (anything 18 or above is fine).
+         - Separate camera window: the same view; its top-left corner reads "324x244  20.0 fps"
+           (anything 18 or above is fine).
          Close the 3D window; everything should shut down by itself.
 
   [ ] 3. Flight.  flypilot\launch.cmd waypoints
@@ -143,6 +225,98 @@ commands below assume your terminal is in the repo folder.
          straight down, then "landed", "Shutting down...", "Done." cmd may then ask
          "Terminate batch job (Y/N)?"; answer Y.
 
+  [ ] 5. Avoidance.  flypilot\launch.cmd avoid
+         Expected terminal output (your numbers will differ a little):
+           INFO    orders: stop 1 added at (2.5, 0.0)
+           INFO    orders: stop 2 added at (2.5, -0.9)
+           INFO    orders: stop 3 added at (0.0, -0.9)
+           INFO    avoidance test: route "blocked" on the "building" map, policy "Geometric TTC" ...
+           ...
+           INFO    taking off to 0.50 m
+           INFO    AVOID   episode 1: signal 0.51 >= 0.50 (front ray 0.78 m, TTC 1.9 s)
+           INFO    NOMINAL resumed after 7.8 s in AVOID
+           INFO    stop 1 (2.5, 0.0) reached in 12.3 s
+           INFO    orders: stop 1 delivered
+           INFO    stop 2 (2.5, -0.9) reached in 4.7 s
+           INFO    orders: stop 2 delivered
+           INFO    stop 3 (0.0, -0.9) reached in 7.8 s
+           INFO    orders: stop 3 delivered
+           INFO    back home
+           INFO    landing at (0.00, 0.04)
+           INFO    landed
+           INFO    3 delivered, 0 skipped with 1 avoidance episode(s)
+           avoid_demo.py finished with exit code 0.
+         Pass = exactly ONE "AVOID episode" line, no SAFETY STOP, exit code 0. More than one
+         episode at the crate means the mode is chattering.
+         The "Delivery stops" window shows the same flight from above: the three stops, crate3
+         drawn as an orange outline marked "not on map", and the drone's trail turning red where
+         it dodges.
+         The dashboard on the right of the 3D view, top to bottom:
+           - what is making the decision: which sensors the policy reads (green = used), the
+             policy, the supervisor (state machine), and the firmware controller. The "Fly brain"
+             box stays gray until the connectome policy exists.
+           - the supervisor's mode: NOMINAL (green, following the route) or AVOID (red), and in
+             AVOID the checklist that must hold before it returns to the route.
+           - the avoid signal over the last 15 s, with the enter (0.50) and exit (0.25) lines;
+             red bands are time spent in AVOID.
+           - a top view: stops, planned route, trail (green = route, red = avoiding), and the
+             range-sensor rays.
+           - the five range-sensor distances.
+
+  [ ] 6. No false alarms.  flypilot\launch.cmd avoid --route square
+         Pass = "3 delivered, 0 skipped with 0 avoidance episode(s)" and exit code 0.
+
+  [ ] 7. Stops you pick.  flypilot\launch.cmd deliver
+         The drone takes off and hovers over a blue "H". In the "Delivery stops" window:
+           a. Left-click an open spot of the map. An orange "1" appears there (also in the 3D
+              view) and the drone flies to it; on arrival it turns green.
+           b. Click a spot on the far side of the long partition (the bar north of the H). The
+              drone takes a planned path around the partition instead of flying at it: the
+              terminal says "stop N: planned ... legs".
+           c. Hover over a crate: the ring turns red. Clicking there is refused ("refused ...").
+           d. Add a stop, then press its X before the drone gets there: "stop N cancelled", and
+              its marker disappears.
+           e. Press "building" under "Path planner knows", then add a stop behind a crate. The
+              crate now shows "not on map", and the drone has to dodge it (an AVOID episode).
+           f. Press "Go home": "will return home when the queue is done". After the last stop
+              the drone flies home and lands.
+           g. In the 3D view, double-click the floor once: that adds a stop too.
+         Expected terminal output (your stops and times will differ):
+           INFO    orders: stop 1 added at (1.0, 0.6)
+           INFO    stop 1 (1.0, 0.6) reached in 3.8 s
+           INFO    orders: stop 1 delivered
+           INFO    orders: stop 2 added at (-0.7, 1.6)
+           INFO    stop 2: planned 6 legs, 3.6 m (straight line 2.0 m)
+           ...
+           INFO    orders: will return home when the queue is done
+           INFO    back home
+           INFO    landing at (-0.02, -0.01)
+           INFO    landed
+           INFO    3 delivered, 0 skipped with 1 avoidance episode(s)
+           avoid_demo.py finished with exit code 0.
+         Pass = every stop you added ends "delivered" (or "cancelled" when you cancelled it), no
+         SAFETY STOP, exit code 0.
+         Also run the scripted version once:
+           flypilot\launch.cmd deliver --at 1.0,0.6 --at -0.7,1.6 --at 1.0,0.6 --return
+         Pass = "3 delivered, 0 skipped with 0 avoidance episode(s)": both crossings of the
+         partition are planned around it.
+
+  [ ] 8. People and a cart.  flypilot\launch.cmd avoid --route headon   (then hover, crossing, cart)
+         The terminal first prints "Scene: street (street.xml)" and the window shows the walkway,
+         the road, two people and a red cart. In the dashboard, a person coming at the drone shows
+         as "moving obstacle: 0.9 m/s toward the drone (front ray)" in magenta. Expected (numbers
+         differ a little):
+           headon    AVOID episode 1 ... (front ray ~1.5 m ...)
+                     closest approach (drone edge to mover edge): person1 0.12 m; contacts: none
+           hover     AVOID episode 1 ... (back ray ~1.6-2.2 m ...)
+                     closest approach ...: person2 0.15 m; contacts: none
+           crossing  closest approach ...: person1 -0.07 m; contacts: person1 x2
+           cart      closest approach ...: cart1 -0.07 m; contacts: cart1 x1 or x2
+         Pass = headon and hover end with "contacts: none" and exit code 0. Contacts in crossing
+         and cart are today's expected result (they come in between the four range-sensor
+         directions); report them if they turn into a safety stop. Then run
+         flypilot\launch.cmd deliver --scene street and add a few stops on both sides of the road.
+
 
 5. TROUBLESHOOTING
 ------------------
@@ -161,9 +335,33 @@ commands below assume your terminal is in the repo folder.
      flypilot\stop_sim.cmd and start again. Check flypilot\logs\sim.log for errors.
 
   The camera window stays on "waiting for tcp://127.0.0.1:5050"
-     Either the sim is not running, or another camera viewer already has the stream: the sim's
-     camera bridge serves ONE viewer at a time, and a second one kicks the first off. Don't run
-     camera.cmd next to launch.cmd (launch.cmd already opens a camera view).
+     Either the sim is not running, or another client already has the stream: the sim's camera
+     bridge serves ONE client at a time, and a second one kicks the first off. Don't run
+     camera.cmd during launch.cmd avoid (the avoidance demo is that client).
+
+  No dashboard on the right of the 3D view during launch.cmd avoid
+     Check flypilot\logs\dashboard.log. "cannot listen on udp port 5300" means an old dashboard
+     is still running: run flypilot\stop_sim.cmd and try again.
+
+  No "Delivery stops" window during avoid or deliver
+     It may be behind other windows or on another monitor: check the taskbar. Errors go to
+     flypilot\logs\dashboard.log.
+
+  Clicks in the "Delivery stops" window do nothing
+     It accepts clicks only once the flight is running (its right side then shows the
+     instructions and buttons). A refused stop says why under the buttons and in the terminal.
+
+  The people and the cart stand still in a street test
+     Re-run flypilot\setup.cmd after a git pull: moving them is part of our CrazySim patch.
+     flypilot\logs\sim.log should list "movers ['cart1', 'person1', 'person2']".
+
+  Double-clicking in the 3D view adds nothing
+     - Re-run flypilot\setup.cmd after a git pull: the clicking is part of our CrazySim patch.
+     - Double-click with the LEFT button, on the floor itself. Double-clicking the drone selects
+       the drone instead (that's MuJoCo's own feature).
+
+  "cannot listen for orders on udp port 5310"
+     Another avoid/deliver flight is still running. Close it, or run flypilot\stop_sim.cmd.
 
   Lines like "QFontDatabase: Cannot find font directory" (when running camera.cmd directly)
      Harmless. OpenCV's built-in Qt has no fonts bundled; the viewer doesn't need them.
@@ -191,23 +389,63 @@ commands below assume your terminal is in the repo folder.
      "Wait for sensor calibration", and nothing can connect to it.
 
   crazyflie-simulation\crazysim-wsl-realtime.patch
-     Makes the simulator keep real time under WSL:
+     Makes the simulator keep real time under WSL, and adds the overlays:
        - the 3D window's text overlay and the drone camera no longer block the physics loop
        - the loop catches up after slow steps
        - the mirror-like floor reflection is turned off. It looks cleaner, saves GPU time, and a
          real drone camera would not see mirrored obstacles.
+       - the 3D window shows the drone camera inset, and any side panel another program writes
+         to /dev/shm/crazysim_overlay.rgb (that is how the avoidance dashboard gets in).
+       - a double-click on the scenery is sent to UDP port 5310, where the flight takes stop
+         requests (the Stops window sends to the same port), and markers sent to UDP 5311 are
+         drawn into the 3D view only.
+       - the scene's people and cart (mocap bodies) move as the flight commands on UDP 5312.
+       - each horizontal range sensor casts a level fan of three rays (-10, 0, +10 degrees) and
+         reports the nearest hit. A real VL53L1x sees a ~27 degree cone, and CrazySim's single
+         thin ray missed box corners until the drone was 0.07 m away.
+  After a git pull that changes a patch, re-run setup.cmd: it swaps the old patch for the new one.
 
 
-7. NATIVE LINUX (Ubuntu) INSTEAD OF WINDOWS
+7. HOW THE AVOIDANCE IS ORGANISED (and where the fly brain goes)
+----------------------------------------------------------------
+  Every control tick (20 Hz):
+     sensors + camera frame --> POLICY --> avoid signal (0..1) + dodge velocity
+     avoid signal + range clearance --> SUPERVISOR (state machine) --> NOMINAL or AVOID
+     NOMINAL: fly the planned path.   AVOID: fly the policy's dodge, then re-plan.
+     The firmware keeps it stable.
+
+  avoidance.py   the contract (AvoidancePolicy.step(sensors, frame) -> AvoidCommand) and the
+                 supervisor. Enter AVOID at signal >= 0.50; return to the route only after the
+                 signal < 0.25 AND clearance > 0.5 m have held for 0.4 s, and never sooner than
+                 0.4 s after entering. One threshold would make the drone chatter in and out.
+  policies.py    the policies. Today: "Geometric TTC" (time-to-collision on the range sensors;
+                 closing speed = the drone's own motion + how fast each range shrinks, so it also
+                 sees things coming at it). The looming-detector and connectome (fly brain)
+                 policies get added here, behind the same interface, and are picked with
+                 avoid_demo.py --policy <name>.
+  avoid_demo.py  flies the stops on planned paths with whichever policy is chosen; never looks
+                 inside a policy. It adds the same safety rules around every policy: slow down
+                 near mapped obstacles, back out of a dodge that ended too close to something,
+                 and keep the setpoint inside the geofence.
+  dashboard.py   the panel in the 3D window. It shows whichever policy is running, and which
+                 sensors it reads.
+
+  Decision cost. The end goal is a small drone with little computing power, so every decision
+  is timed. At the end of each avoid flight the terminal prints "decision cost (sensors + policy
+  + supervisor): mean .. us"; bench.cmd gives the same number without the noise of a live flight.
+  Measured on the geometric policy: about 3.6 us per decision in replay and about 20-25 us live
+  (the live figure includes Python waiting on the radio and camera threads). The control loop allows
+  50000 us per decision, so this uses well under 0.1%. Keep new policies plain scalar code with
+  no per-tick allocation; that is what ports to C on the drone.
+
+
+8. NATIVE LINUX (Ubuntu) INSTEAD OF WINDOWS
 -------------------------------------------
   From the repo folder:
       sudo bash flypilot/system_deps.sh
       bash flypilot/setup.sh
-      bash flypilot/py.sh launch.py               (sim + camera)
-      bash flypilot/py.sh launch.py waypoints     (sim + camera + flight)
+      bash flypilot/py.sh launch.py               (sim only)
+      bash flypilot/py.sh launch.py waypoints     (sim + flight)
+      bash flypilot/py.sh launch.py avoid         (sim + dashboard + avoidance demo)
       bash flypilot/stop_sim.sh
   Untested on native Linux so far; the steps are the same ones the .cmd files run inside WSL.
-
-
-Coming next: avoid_demo.py (the same flight stack, plus obstacle avoidance from the drone's
-range sensors) and a full README.md.

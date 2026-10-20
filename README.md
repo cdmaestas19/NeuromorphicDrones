@@ -1,7 +1,7 @@
 # Fly Brain Pilot
 ### Connectome-Based Drone Avoidance
 
-> **Status: Work in progress.** This project is in early development. The architecture, experiments, and capabilities described below are planned research goals, not completed or validated results.
+> **Status: Work in progress.** This project is in early development. The architecture, experiments, and capabilities described below are planned research goals, not completed or validated results, except where listed under [Current Progress](#current-progress).
 
 ## Overview
 
@@ -28,7 +28,7 @@ The exact datasets, tools, and detector architecture may change as we evaluate f
 - [ ] Set up the simulation environment and reproduce a published neural response.
 - [ ] Identify visual motion, looming, and escape circuits.
 - [ ] Develop and test camera-to-neural input conversion.
-- [ ] Establish baseline waypoint flight in CrazySim.
+- [x] Establish baseline waypoint flight in CrazySim.
 - [ ] Train the avoidance readout using simulated flight data.
 - [ ] Integrate obstacle avoidance and person detection.
 - [ ] Compare against CNN and shuffled-connectome baselines.
@@ -36,6 +36,21 @@ The exact datasets, tools, and detector architecture may change as we evaluate f
 - [ ] Consider controlled hardware testing if simulation results justify it.
 
 These milestones describe our intended direction and will be updated as development progresses.
+
+## Current Progress
+
+**Baseline flight stack in CrazySim (milestone M3): done.** The [`flypilot/`](flypilot/) package runs the real Crazyflie firmware in CrazySim's MuJoCo simulator and provides:
+
+- **One-command startup from Windows** (`flypilot\launch.cmd`), with the 3D scene, the drone's simulated AI-deck camera view and an avoidance dashboard in one window.
+- **A baseline waypoint flight** with safety stops (it lands on Ctrl-C or on any error).
+- **An obstacle-avoidance demo** driven by the Multi-ranger range sensors. A geometric time-to-collision rule feeds an explicit NOMINAL/AVOID state machine with hysteresis and a minimum dwell, so the drone doesn't chatter near obstacles.
+- **Path planning on a map**, for every flight: the drone routes around the obstacles its map knows about. Anything not on the map is left to the avoidance layer, which is where the fly brain will act.
+- **Delivery stops chosen during the flight** (`flypilot\launch.cmd deliver`): add stops by clicking a map in the "Delivery stops" window, the way a customer would place an order.
+- **Moving obstacles**: a street scene with people walking and a cart driving, in repeatable encounter tests that report the closest approach and any contact. The current rule-based avoidance handles people walking straight at the drone. It is touched by ones crossing from the side, which is where the fly brain should do better.
+- **A single swappable decision interface** (`AvoidancePolicy`), where the looming-detector and connectome policies will plug in. The avoidance is currently geometric; no spiking-network code exists yet.
+- **Decision-cost measurement and a record-and-replay benchmark**, so compute cost stays visible as the fly-brain components are added.
+
+Setup, run order and troubleshooting: [flypilot/README.md](flypilot/README.md). Test checklist for a new PC: [flypilot/run.txt](flypilot/run.txt).
 
 ## Planned Evaluation
 
