@@ -10,6 +10,7 @@ if defined FLYPILOT_DISTRO set "WSL=wsl.exe -d %FLYPILOT_DISTRO%"
 %WSL% --cd "%~dp0." -- bash ./setup.sh || goto :fail
 echo.
 echo Setup finished. Next: flypilot\launch.cmd (tests to run are in flypilot\run.txt)
+echo Re-run flypilot\setup.cmd after every git pull: it brings packages and our CrazySim patches up to date.
 exit /b 0
 
 :fail

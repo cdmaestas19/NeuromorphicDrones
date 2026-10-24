@@ -18,6 +18,7 @@ from typing import NamedTuple
 
 MOVERS_PORT = 5312       # flight -> simulator (crazysim.py MOVER_PORT)
 DRONE_RADIUS_M = 0.07    # Crazyflie 2.x out to the propeller tips
+DRONE_HALF_HEIGHT_M = 0.03
 
 
 class Walk(NamedTuple):
@@ -26,20 +27,41 @@ class Walk(NamedTuple):
     speed: float                     # m/s
     start_near: tuple | None = None  # ((x, y), radius): start once the drone comes this close; None: at take-off
     start_after_s: float = 0.0       # ...and this long after that
-    loop: bool = False               # back and forth along the path, pausing pause_s at each end
-    pause_s: float = 1.5
+    loop: bool = True                # then back and forth along the path for the rest of the flight,
+    pause_s: float = 1.5             # pausing this long at each end (loop=False: walk it once and stop)
+
+
+class Part(NamedTuple):
+    """One geom of a mover, as far as touching it goes: its footprint and how high it reaches."""
+    dx: float        # footprint centre in the body frame
+    dy: float
+    half: tuple      # half extents (x, y); a round footprint has radius = half[0]
+    round: bool
+    top: float       # world height of its highest point
 
 
 class Shape(NamedTuple):
     name: str
     kind: str        # 'person', 'cart' or 'mover' (from the name)
     z: float         # body height in the scene file (kept while moving)
-    half: tuple      # footprint half extents (x, y) in the body frame; a round footprint has radius = half[0]
+    half: tuple      # footprint half extents (x, y) of the first geom, for drawing; round: radius = half[0]
     round: bool
+    parts: tuple = ()  # every geom (Part): a person's body and head, a cart's body and cabin
+    xy: tuple = (0.0, 0.0)  # where the scene file parks it (until a walk moves it)
+
+
+def _part(geom, z: float) -> Part:
+    size = [float(v) for v in geom.get('size', '0.1').split()]
+    gx, gy, gz = (float(v) for v in geom.get('pos', '0 0 0').split())
+    kind = geom.get('type', 'sphere')
+    up = {'box': lambda: size[2], 'capsule': lambda: size[1] + size[0], 'cylinder': lambda: size[1]}.get(
+        kind, lambda: size[0])()
+    half = (size[0], size[1]) if kind == 'box' else (size[0], size[0])
+    return Part(gx, gy, half, kind != 'box', z + gz + up)
 
 
 def load_movers(path) -> dict:
-    """The scene's mocap bodies and their footprints, from the first geom of each (box or round)."""
+    """The scene's mocap bodies: footprints and heights of their geoms (Shape.parts)."""
     try:
         world = ET.parse(path).getroot().find('worldbody')
     except (OSError, ET.ParseError):
@@ -50,22 +72,31 @@ def load_movers(path) -> dict:
         if body.get('mocap') != 'true' or not geoms:
             continue
         name = body.get('name', '')
-        z = float(body.get('pos', '0 0 0').split()[2])
-        size = [float(v) for v in geoms[0].get('size', '0.1').split()]
-        is_box = geoms[0].get('type') == 'box'
+        x, y, z = (float(v) for v in body.get('pos', '0 0 0').split())
         kind = 'person' if name.startswith('person') else 'cart' if name.startswith('cart') else 'mover'
-        out[name] = Shape(name, kind, z, (size[0], size[1]) if is_box else (size[0], size[0]), not is_box)
+        parts = tuple(_part(g, z) for g in geoms)
+        out[name] = Shape(name, kind, z, parts[0].half, parts[0].round, parts, (x, y))
     return out
 
 
-def gap_to(shape: Shape, x: float, y: float, yaw_deg: float, px: float, py: float) -> float:
-    """Horizontal distance from point (px, py) to the edge of the mover's footprint (0 when inside)."""
-    dx, dy = px - x, py - y
-    if shape.round:
-        return max(math.hypot(dx, dy) - shape.half[0], 0.0)
+def gap_to(shape: Shape, x: float, y: float, yaw_deg: float, px: float, py: float, pz: float = 0.0) -> float:
+    """How far the drone (a disc DRONE_RADIUS_M wide and 2 x DRONE_HALF_HEIGHT_M tall at px, py, pz) is from
+    touching the mover at (x, y) turned yaw_deg: for each part, the horizontal distance to its footprint, or
+    the height above its top if the drone is higher; the smallest of those (<= 0: touching)."""
     c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
-    lx, ly = dx * c + dy * s, -dx * s + dy * c
-    return math.hypot(max(abs(lx) - shape.half[0], 0.0), max(abs(ly) - shape.half[1], 0.0))
+    best = math.inf
+    for part in shape.parts:
+        cx, cy = x + part.dx * c - part.dy * s, y + part.dx * s + part.dy * c
+        dx, dy = px - cx, py - cy
+        if part.round:
+            h = max(math.hypot(dx, dy) - part.half[0], 0.0)
+        else:
+            lx, ly = dx * c + dy * s, -dx * s + dy * c
+            h = math.hypot(max(abs(lx) - part.half[0], 0.0), max(abs(ly) - part.half[1], 0.0))
+        h -= DRONE_RADIUS_M
+        above = pz - DRONE_HALF_HEIGHT_M - part.top
+        best = min(best, max(h, above) if above > 0.0 else h)
+    return best
 
 
 class MoverRunner:
@@ -84,7 +115,9 @@ class MoverRunner:
         self._touching = {w.mover: False for w in self.walks}
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    def update(self, t: float, drone_xy: tuple):
+    def update(self, t: float, drone_xy: tuple, drone_z: float = 0.0):
+        """drone_z: a drone higher than a part of a mover (the cart's body in front of its cabin) is above that
+        part, not touching it (gap_to)."""
         cmd = {}
         for w in self.walks:
             if self._t_go[w.mover] is None:
@@ -98,7 +131,7 @@ class MoverRunner:
             shape = self.shapes[w.mover]
             cmd[w.mover] = {'p': [x, y, shape.z], 'v': [vx, vy, 0.0],
                             'yaw': yaw - 90.0 if shape.kind == 'cart' else yaw}  # a cart's long axis is its y
-            gap = gap_to(shape, x, y, cmd[w.mover]['yaw'], *drone_xy) - DRONE_RADIUS_M
+            gap = gap_to(shape, x, y, cmd[w.mover]['yaw'], drone_xy[0], drone_xy[1], drone_z)
             self.min_gap[w.mover] = min(self.min_gap[w.mover], gap)
             touching = gap <= 0.0
             if touching and not self._touching[w.mover]:

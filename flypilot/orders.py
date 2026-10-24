@@ -81,9 +81,12 @@ def _ray_gap(eye, hit, p) -> float:
 class OrderBook:
     """The delivery queue: takes requests, hands out stops in order, plans the route on show."""
 
-    def __init__(self, altitude: float, fence: dict, obstacles=(), map_name: str = 'all'):
+    def __init__(self, altitude: float, fence: dict, obstacles=(), map_name: str = 'all',
+                 cruise: float | None = None):
+        """altitude: where stops are checked and flown to (the drop-off height); cruise: the height the
+        planner plans the paths between stops at (default: the same)."""
         self.altitude, self.fence, self.obstacles = altitude, fence, list(obstacles)
-        self.planner = Planner(self.obstacles, fence, altitude, map_name)
+        self.planner = Planner(self.obstacles, fence, cruise or altitude, map_name)
         self.map_version = 0     # bumped on every map change, so the flight knows to re-plan
         self.home = (0.0, 0.0)
         self.drone = (0.0, 0.0)  # updated by the flight each tick

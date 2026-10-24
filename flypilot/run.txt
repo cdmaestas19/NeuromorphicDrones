@@ -3,9 +3,10 @@ FLY BRAIN PILOT - flypilot/ : HOW TO SET UP, RUN AND TEST
 
 What this is
   A simulated Crazyflie drone in CrazySim: MuJoCo physics plus the real Crazyflie firmware, a 3D
-  window, the drone's own camera view, and Python flight scripts. This is milestone M3: ordinary
-  flight control plus a geometric (range-sensor) avoidance demo. There is no fly-brain code here
-  yet. flypilot\README.md explains how it all fits together.
+  window, the drone's own camera view, and Python flight scripts: ordinary flight control, a
+  geometric (range-sensor) avoidance policy, and the fly brain (the fruit fly's escape circuit,
+  run as a spiking network) as a second avoidance policy. flypilot\README.md explains how it all
+  fits together; flybrain\README.md explains the fly brain.
 
 You run everything from a normal Windows terminal (PowerShell, cmd, or the VS Code terminal). The
 .cmd files start everything inside WSL for you, so you never have to open WSL yourself. The
@@ -20,8 +21,15 @@ commands below assume your terminal is in the repo folder.
     graphics driver (DirectX 12), so most NVIDIA, AMD or Intel GPUs from the last several years
     should work, including the integrated graphics in most laptops, as long as the driver is up
     to date.
-  - About 2 GB of free disk space inside WSL (sim + firmware build + Python packages).
-  - 2 CPU cores are enough; any normal PC has at least that.
+  - About 3 GB of free disk space inside WSL: the sim and firmware build (~0.8 GB), the flight's
+    Python (~0.55 GB), the fly brain's Python, model and connectome data (~1 GB). Training the
+    camera network yourself (optional, run.txt test 10) adds ~1 GB.
+  - 2 CPU cores are enough for the sim and the geometric policy. The fly brain runs in a process
+    of its own and needs most of one more core (~5 ms per 50 ms tick on a free core; with a game
+    running it can take 30-40 ms, and its reactions get later), so 4 cores for fly-brain flights.
+  - Memory: 8 GB is plenty for flying. Only the brain checks that simulate the whole fly brain
+    (brain_reproduce.cmd, brain_validate.cmd) need more: 3-4.3 GB per simulation, run as many
+    at once as memory allows.
 
   What we measured on one PC (RTX 4080, 20 cores), emulating weaker machines:
     GPU, 20 cores ........... sim at real time, camera 20 fps, waypoint flight OK
@@ -50,16 +58,23 @@ commands below assume your terminal is in the repo folder.
 
   c) Clone this repo anywhere on Windows, open a terminal in the repo folder, and run:
          flypilot\setup.cmd
-     The first run takes about 5-10 minutes. It:
-       - installs build tools and graphics libraries inside WSL (runs as root, so no password
-         prompt)
+     The first run takes about 10-15 minutes. It:
+       - installs build tools, graphics libraries and xdotool (which puts the windows on your
+         second screen) inside WSL (runs as root, so no password prompt)
        - downloads CrazySim into ~/CrazySim inside WSL, pinned to the version we tested
        - applies our two fixes from flypilot\patches\ (see section 6)
        - creates the Python environment ~/.venvs/flybrain and installs
          flypilot\requirements.txt
        - builds the simulated Crazyflie firmware
-     It ends with "Setup finished". It is safe to re-run at any time, e.g. after a git pull
-     that changes requirements or patches.
+       - for the fly brain (flybrain\setup_brain.sh): downloads the fly-brain model with its
+         connectome data (~200 MB, into ~/Drosophila_brain_model) and the FlyWire cell-type
+         labels (~/flywire_annotations), and creates the brain's own Python environment
+         ~/.venvs/flybrain-snn (Brian2)
+     It ends with "Setup finished". It is safe to re-run at any time, and you should re-run it
+     after every git pull: that is how changes to requirements, system packages and our CrazySim
+     patches reach your PC (an old version of a patch is replaced automatically).
+     The camera's person / vehicle network comes ready-trained (flypilot\models\); nothing to set
+     up for it.
 
   More than one WSL distro? The scripts use your default one. To pick another, set this first,
   in the same terminal:
@@ -137,21 +152,53 @@ commands below assume your terminal is in the repo folder.
       window.
 
   MOVING OBSTACLES: PEOPLE AND A CART
-      These run in the "street" scene: the same room with a walkway across it (light) and a road
-      down it (dark, dashed yellow line), two people and a cart. The window is then titled "MuJoCo
-      : Street scene with people and a cart". The people and the cart follow scripted paths, timed
-      so the encounter happens in the same place every run. They are never on the planner's map,
-      so dodging them is the avoidance's job. At the end the terminal prints the closest approach
-      to each of them and any contacts.
+      These run in the "street" scene: a 12 x 12 m courtyard with a walkway across it (light), a
+      road down it (dark, dashed yellow line, zebra crossing), trees, benches, a kiosk, three people
+      and a golf-cart-sized cart. The window is then titled "MuJoCo : Street scene with people and a
+      cart". The people and the cart follow scripted paths back and forth; the first encounter is
+      timed to happen in the same place every run. They are never on the planner's map, so dodging
+      them is the avoidance's job. At the end the terminal prints the closest approach to each of
+      them and any contacts.
         flypilot\launch.cmd avoid --route headon     a person walks along the walkway at the drone
         flypilot\launch.cmd avoid --route hover      a person walks up behind the hovering drone
         flypilot\launch.cmd avoid --route crossing   a person crosses the drone's path from the side
         flypilot\launch.cmd avoid --route cart       the cart drives down the road across its path
-        flypilot\launch.cmd deliver --scene street   your own stops while the person and the cart
-                                                     go back and forth the whole time
-      Today's geometric policy dodges headon and hover. It gets touched in crossing and cart,
-      because those come in between its four sensor directions. That is the comparison these
-      tests are for: a camera-based looming detector and the fly brain should do better there.
+        flypilot\launch.cmd avoid --route lane       the cart drives up the road at the drone while it
+                                                     is in the middle of the lane
+        flypilot\launch.cmd avoid --route wallside   a crate nobody mapped, on the path along the
+                                                     south wall: it must go round on the open side
+        flypilot\launch.cmd avoid --route dropoff    the drone cruises at 4.5 m (above everyone) and
+                                                     comes down to drop off; a person walks into the
+                                                     drop-off point
+        flypilot\launch.cmd avoid --route poles      cruising at 4.5 m, a 6 m pole nobody mapped
+                                                     stands on the path
+        flypilot\launch.cmd avoid --route landing    the stop is where the cart is parked: it waits
+                                                     above, then comes down beside it
+        flypilot\launch.cmd deliver --scene street   your own stops while people and the cart go
+                                                     back and forth the whole time. It cruises at 4.5 m
+                                                     between stops and comes down to 0.5 m at each
+      Add --policy flybrain to any of these to let the fly brain decide (see THE FLY BRAIN below).
+      With two screens the windows open on the one that isn't your main screen. --screen main keeps
+      them on the main one; --headless opens no windows at all (for runs while you use the PC for a
+      game: nothing pops up or takes the focus).
+
+  THE FLY BRAIN
+      flypilot\launch.cmd avoid --route hover --policy flybrain   (or any route, or deliver)
+      launch.cmd starts the brain server too (log: flypilot\logs\brain.log). The fly brain sees
+      through a 360-degree compound eye: a ring of "ommatidia" every 5 degrees all the way round and
+      from straight down to 30 degrees up. Its looming detectors drive the escape circuit of the
+      fruit fly's connectome. When the giant fibers fire, the drone makes an escape burst like a
+      fly's takeoff: up, sideways away from the threat, and forward or back away from it.
+      flybrain\README.md explains it.
+      flypilot\brain_reproduce.cmd   checks the brain model against its paper (needs ~5 GB of free
+                                     memory per simulation; it runs as many at once as fit)
+      flypilot\brain_validate.cmd    checks the drone's cut-out circuit against the whole brain
+
+  WHAT EVERY FLIGHT DOES AROUND THE AVOIDANCE (any policy)
+      - A dodge slows down rather than fly into something the eye sees.
+      - After climbing to dodge, the drone comes back down only while the eye sees room below it.
+      - After each avoidance episode, unmapped static things it met (a crate, not a person) go on
+        the planner's map, so the next path goes round them: orange dots on the top views.
 
   flypilot\launch.cmd avoid --record recordings\blocked.jsonl
       Also saves every decision's inputs and outputs (one line per decision) to
@@ -178,8 +225,8 @@ commands below assume your terminal is in the repo folder.
       flypilot\setup.cmd       the one-time setup from section 2.
 
   Logs
-      When started through launch.cmd, the sim, dashboard and camera output go to
-      flypilot\logs\sim.log, dashboard.log and camera.log. The simulated firmware's console is
+      When started through launch.cmd, the sim, dashboard, camera and fly-brain output go to
+      flypilot\logs\sim.log, dashboard.log, camera.log and brain.log. The simulated firmware's console is
       ~/CrazySim/crazyflie-firmware/sitl_make/build/0/out.log inside WSL. In File Explorer that is
       \\wsl.localhost\Ubuntu-24.04\home\<your linux user>\CrazySim\... (use your distro name).
 
@@ -253,8 +300,8 @@ commands below assume your terminal is in the repo folder.
          it dodges.
          The dashboard on the right of the 3D view, top to bottom:
            - what is making the decision: which sensors the policy reads (green = used), the
-             policy, the supervisor (state machine), and the firmware controller. The "Fly brain"
-             box stays gray until the connectome policy exists.
+             policy, the supervisor (state machine), and the firmware controller. The "360
+             compound eye" and "Fly brain" boxes light up only with --policy flybrain (test 9).
            - the supervisor's mode: NOMINAL (green, following the route) or AVOID (red), and in
              AVOID the checklist that must hold before it returns to the route.
            - the avoid signal over the last 15 s, with the enter (0.50) and exit (0.25) lines;
@@ -301,21 +348,36 @@ commands below assume your terminal is in the repo folder.
          Pass = "3 delivered, 0 skipped with 0 avoidance episode(s)": both crossings of the
          partition are planned around it.
 
-  [ ] 8. People and a cart.  flypilot\launch.cmd avoid --route headon   (then hover, crossing, cart)
-         The terminal first prints "Scene: street (street.xml)" and the window shows the walkway,
-         the road, two people and a red cart. In the dashboard, a person coming at the drone shows
-         as "moving obstacle: 0.9 m/s toward the drone (front ray)" in magenta. Expected (numbers
-         differ a little):
-           headon    AVOID episode 1 ... (front ray ~1.5 m ...)
-                     closest approach (drone edge to mover edge): person1 0.12 m; contacts: none
-           hover     AVOID episode 1 ... (back ray ~1.6-2.2 m ...)
-                     closest approach ...: person2 0.15 m; contacts: none
-           crossing  closest approach ...: person1 -0.07 m; contacts: person1 x2
-           cart      closest approach ...: cart1 -0.07 m; contacts: cart1 x1 or x2
-         Pass = headon and hover end with "contacts: none" and exit code 0. Contacts in crossing
-         and cart are today's expected result (they come in between the four range-sensor
-         directions); report them if they turn into a safety stop. Then run
+  [ ] 8. People and a cart.  flypilot\launch.cmd avoid --route headon   (then hover, crossing, cart, lane, wallside)
+         The terminal first prints "Scene: street (street.xml)" and the window shows the courtyard,
+         the walkway, the road, three people and a red cart. Each run ends with a line like
+           closest approach (drone edge to mover edge): person1 0.13 m; contacts: none
+         Expected results are in flypilot\README.md (Moving obstacles). Pass = the flight ends
+         with exit code 0 and a "closest approach" line; note any contacts. Then run
          flypilot\launch.cmd deliver --scene street and add a few stops on both sides of the road.
+
+  [ ] 9. The fly brain.  flypilot\launch.cmd avoid --route hover --policy flybrain
+         (then headon, crossing, cart, lane, dropoff, wallside, square, blocked with --policy flybrain)
+         The terminal prints "fly brain ready in N s: escape subcircuit of 3118 neurons ...". In the
+         dashboard the sensor boxes light up green (Multi-ranger "up: room to climb", the camera, the
+         "360 compound eye", "Fly brain"), a "Route map" box feeds the policy (yellow when the map
+         chose the side), and the lower right panel becomes a radar of what the eye sees all round.
+         An escape logs
+           AVOID   episode 1: signal 0.67 >= 0.50 (giant fibers L 49 R 67 Hz; eye drive ...)
+         The maneuver line says what it escaped from: "not over it (a person)" near people, "up over
+         it (a vehicle)" from the cart. The flight ends with "fly brain over N ticks: ... brain
+         compute X ms per 50 ms tick; ... side chosen by: eye N, map N, ...".
+         Pass = exit code 0, square with 0 avoidance episodes (no false alarms), and in wallside the
+         drone goes round the crate on the side away from the wall. Note any contacts.
+
+  [ ] 10. The camera's person / vehicle network (optional: the trained weights are in the repo).
+         flypilot\camera_train.cmd
+         The first run installs its own Python environment (PyTorch, CPU only, ~200 MB). It labels
+         the frames of every recorded flight in flypilot\recordings (fly with --record to add some),
+         trains for a few minutes, and prints a confusion matrix over flights it held out, then
+         "weights -> ...models/camera_kind.npz (numpy forward pass matches PyTorch to ...)".
+         Pass = exit code 0 and an accuracy line. With fewer than ~20 recorded street flights the
+         numbers mean little.
 
 
 5. TROUBLESHOOTING
@@ -329,6 +391,22 @@ commands below assume your terminal is in the repo folder.
 
   No windows appear at all
      WSLg is missing or outdated. Run "wsl --update" (Windows 10 needs 21H2 or newer).
+
+  "The sim closed during the flight", and flypilot\logs\sim.log says "X11: Failed to open
+  display :0" or "could not initialize GLFW"
+     WSL's graphics service (WSLg) didn't start this time. In PowerShell run "wsl --shutdown",
+     then launch again.
+
+  "the fly brain is not answering on udp://127.0.0.1:5320"
+     Check flypilot\logs\brain.log. "no brain environment": re-run flypilot\setup.cmd.
+
+  The fly brain never reacts to the people or the cart
+     Re-run flypilot\setup.cmd after a git pull: the compound eye is part of our CrazySim patch.
+     flypilot\logs\sim.log should list "compound eye: 1800 ommatidia".
+
+  The fly brain reacts late; its summary says "answers later than one tick: (many) tick(s)"
+     The brain needs about 12 ms of one CPU core per 50 ms tick. Games and other heavy programs
+     running at the same time slow it down to 40-45 ms; close them for fly-brain runs.
 
   "not flying: no simulator answering" or "could not connect"
      The sim isn't running or didn't finish starting. Use launch.cmd, which waits for it. Or run
@@ -353,7 +431,7 @@ commands below assume your terminal is in the repo folder.
 
   The people and the cart stand still in a street test
      Re-run flypilot\setup.cmd after a git pull: moving them is part of our CrazySim patch.
-     flypilot\logs\sim.log should list "movers ['cart1', 'person1', 'person2']".
+     flypilot\logs\sim.log should list "movers ['cart1', 'person1', 'person2', 'person3']".
 
   Double-clicking in the 3D view adds nothing
      - Re-run flypilot\setup.cmd after a git pull: the clicking is part of our CrazySim patch.
@@ -403,11 +481,13 @@ commands below assume your terminal is in the repo folder.
        - each horizontal range sensor casts a level fan of three rays (-10, 0, +10 degrees) and
          reports the nearest hit. A real VL53L1x sees a ~27 degree cone, and CrazySim's single
          thin ray missed box corners until the drone was 0.07 m away.
+       - a compound eye: every 5 degrees all the way round, from straight down to 30 degrees up,
+         the distance to the first thing in that direction, sent 20 times a second to UDP 5330.
   After a git pull that changes a patch, re-run setup.cmd: it swaps the old patch for the new one.
 
 
-7. HOW THE AVOIDANCE IS ORGANISED (and where the fly brain goes)
-----------------------------------------------------------------
+7. HOW THE AVOIDANCE IS ORGANISED
+---------------------------------
   Every control tick (20 Hz):
      sensors + camera frame --> POLICY --> avoid signal (0..1) + dodge velocity
      avoid signal + range clearance --> SUPERVISOR (state machine) --> NOMINAL or AVOID
@@ -418,11 +498,16 @@ commands below assume your terminal is in the repo folder.
                  supervisor. Enter AVOID at signal >= 0.50; return to the route only after the
                  signal < 0.25 AND clearance > 0.5 m have held for 0.4 s, and never sooner than
                  0.4 s after entering. One threshold would make the drone chatter in and out.
-  policies.py    the policies. Today: "Geometric TTC" (time-to-collision on the range sensors;
-                 closing speed = the drone's own motion + how fast each range shrinks, so it also
-                 sees things coming at it). The looming-detector and connectome (fly brain)
-                 policies get added here, behind the same interface, and are picked with
-                 avoid_demo.py --policy <name>.
+  policies.py    the policies, picked with --policy <name>:
+                   geometric  "Geometric TTC": time-to-collision on the range sensors (closing
+                              speed = the drone's own motion + how fast each range shrinks, so
+                              it also sees things coming at it)
+                   flybrain   "Fly brain (connectome)": the compound eye's looming drives the
+                              fly's looming detectors in the connectome's escape circuit
+                              (flybrain\brain_server.py, its own process); the giant fibers say
+                              when to escape, the steering neurons which side to escape from
+                 New policies (the other comparison arms) go here, behind the same interface.
+  eye.py         the compound eye and its looming, for the fly brain
   avoid_demo.py  flies the stops on planned paths with whichever policy is chosen; never looks
                  inside a policy. It adds the same safety rules around every policy: slow down
                  near mapped obstacles, back out of a dodge that ended too close to something,

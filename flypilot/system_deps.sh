@@ -12,8 +12,9 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
     git ca-certificates cmake build-essential pkg-config \
-    python3 python3-venv \
+    python3 python3-venv python3-dev \
     libgl1 libegl1 libgl1-mesa-dri libglib2.0-0 \
     libx11-6 libxrandr2 libxinerama1 libxcursor1 libxi6 libxkbcommon-x11-0 \
     libsm6 libice6 \
-    mesa-utils
+    mesa-utils \
+    xdotool  # launch.py moves its windows to another screen with it (screens.py)

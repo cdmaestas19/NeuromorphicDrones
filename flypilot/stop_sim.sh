@@ -6,5 +6,6 @@ pkill -f '/crazysim_cpx\.py' && echo "stopped camera bridge" || true
 pkill -f '/crazysim\.py' && echo "stopped simulator" || true
 pkill -f 'python.* dashboard\.py' && echo "stopped dashboard" || true
 pkill -f 'python.* camera_view\.py' && echo "stopped camera view" || true
+pkill -f 'python.* brain_server\.py' && echo "stopped fly brain" || true
 rm -f /dev/shm/crazysim_overlay.rgb /dev/shm/crazysim_overlay.rgb.tmp
 echo "CrazySim stopped."

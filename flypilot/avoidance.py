@@ -3,17 +3,17 @@ decides when the drone is avoiding.
 
 Once per control tick (20 Hz):
     Sensors + camera frame  -->  AvoidancePolicy.step()  -->  AvoidCommand(signal, dodge)
-    signal + Multi-ranger clearance  -->  AvoidanceSupervisor  -->  NOMINAL or AVOID
+    signal + clearance all round (compound eye)  -->  AvoidanceSupervisor  -->  NOMINAL or AVOID
     NOMINAL: the route navigator flies the drone.  AVOID: the drone flies AvoidCommand.dodge.
 
-Any policy (the geometric rule now; a looming detector or the connectome later) implements
-AvoidancePolicy and nothing else changes. The supervisor never looks inside a policy.
+Any policy (the geometric rules, the connectome, ...) implements AvoidancePolicy and nothing else
+changes. The supervisor never looks inside a policy.
 """
 import enum
 import math
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import numpy as np
 
@@ -37,10 +37,19 @@ class Sensors(NamedTuple):
     intended_velocity_body: Vec3  # what the route navigator is asking for right now (body frame) [m/s]
     ranges: dict                  # Multi-ranger, body frame: front/back/left/right/up [m]; inf = nothing within 4 m
     mode: 'Mode'                  # supervisor mode on the previous tick, so a policy can run a maneuver
+    eye: tuple | None = None      # the 360-degree compound eye's newest reading (eye.py): (sim time, position,
+                                  # distances[elevation, azimuth], world-aligned); None without one
+    route_stop_m: float = math.inf  # how far ahead the route will bring the drone to a stop (its next stop, or
+                                    # 0 while holding); inf when it flies on. An efference copy of the plan
+    route_cost: Callable[[float, float, float, float], float] | None = None
+    # route_cost(x0, y0, x1, y1): how long the way to the current stop is if the drone first escapes straight
+    # from (x0, y0) to (x1, y1), on the planner's map (planner.Planner.route_cost; inf: that escape runs into
+    # something mapped). None without a map for this leg (bench.py replays, or just after the map grew)
 
 
 def make_sensors(t: float, position: Vec3, yaw_deg: float, velocity_world: Vec3, intended_velocity_world: Vec3,
-                 ranges: dict, mode: Mode) -> Sensors:
+                 ranges: dict, mode: Mode, eye: tuple | None = None, route_stop_m: float = math.inf,
+                 route_cost: Callable | None = None) -> Sensors:
     """Build one tick's Sensors, rotating the world-frame velocities into the body frame.
     Shared by the flight (avoid_demo.py) and the offline replay (bench.py), so both time the same code."""
     yaw = yaw_deg * (math.pi / 180.0)
@@ -48,7 +57,7 @@ def make_sensors(t: float, position: Vec3, yaw_deg: float, velocity_world: Vec3,
     vx, vy, vz = velocity_world
     ix, iy, iz = intended_velocity_world
     return Sensors(t, position, yaw_deg, velocity_world, (vx * c + vy * s, vy * c - vx * s, vz),
-                   (ix * c + iy * s, iy * c - ix * s, iz), ranges, mode)
+                   (ix * c + iy * s, iy * c - ix * s, iz), ranges, mode, eye, route_stop_m, route_cost)
 
 
 class AvoidCommand(NamedTuple):
@@ -61,8 +70,10 @@ class AvoidancePolicy(ABC):
     """Decides WHEN and WHICH WAY to dodge. The firmware's controller keeps the drone stable."""
 
     name = 'unnamed policy'
-    inputs: tuple = ()            # which sensors it reads: 'multiranger', 'camera'
+    inputs: tuple = ()            # which sensors it reads: 'multiranger', 'camera', '360 eye'
     description = ''
+    brake_on_avoid = True         # the flight stops the drone when AVOID starts, before the dodge (an escape that
+                                  # keeps its momentum sets this False)
 
     def reset(self):
         """Called before a flight and after every avoidance episode. Default: nothing to reset."""
@@ -80,8 +91,9 @@ class AvoidanceSupervisor:
                         interruption, for dwell_s; and never sooner than dwell_s after entering AVOID.
 
     With a single threshold, a signal hovering near it flips the mode on every noisy sample. The gap
-    between enter and exit, plus the dwell, is what stops that chatter. Clearance comes from the
-    Multi-ranger whichever policy is deciding, as a policy-independent safety gate on resuming.
+    between enter and exit, plus the dwell, is what stops that chatter. Clearance is the nearest thing
+    ahead and to the sides at flying height (eye.clearance; the Multi-ranger's front/left/right without the
+    eye), whichever policy is deciding: a policy-independent safety gate on resuming.
     """
 
     def __init__(self, enter: float = 0.5, exit: float = 0.25, dwell_s: float = 0.4, clearance_m: float = 0.5):

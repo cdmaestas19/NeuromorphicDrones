@@ -12,6 +12,10 @@
 Every flight follows paths planned on a map (planner.py).
     launch.cmd --camera-window [waypoints]   also open the separate camera_view window (checks the
                                         AI-deck stream's fps; not with avoid/deliver, which read the stream)
+    launch.cmd avoid --screen main      where the windows open (screens.py): auto (default: a screen
+                                        other than the main one, if there is one), main, 1, 2, ..., off
+    launch.cmd avoid --headless         no windows at all (test runs while the PC is used for a game:
+                                        nothing pops up or takes the focus)
 
 Ctrl-C during a flight lands the drone and then shuts everything down. Otherwise, closing the MuJoCo
 window or pressing Ctrl-C shuts everything down. Sim, camera and dashboard output go to flypilot/logs/.
@@ -24,6 +28,7 @@ import sys
 import time
 from pathlib import Path
 
+import screens
 from flight import SIM_URI, sim_is_up
 from planner import SCENES
 from routes import ROUTES
@@ -44,6 +49,28 @@ def start(name: str, cmd: list[str], env: dict | None = None) -> subprocess.Pope
     out = open(LOG_DIR / f'{name}.log', 'w')
     return subprocess.Popen(cmd, cwd=HERE, stdout=out, stderr=subprocess.STDOUT, start_new_session=True,
                             env=None if env is None else {**os.environ, **env})
+
+
+def uses_brain(script_args: list[str]) -> bool:
+    """Whether the flight's policy is the fly brain (it needs flybrain/brain_server.py running)."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument('--policy', default='geometric')
+    return p.parse_known_args(script_args)[0].policy == 'flybrain'
+
+
+def start_brain(timeout: float = 180.0) -> subprocess.Popen:
+    """Start the fly-brain server (its own Python environment) and wait until it listens."""
+    print('Starting the fly brain (escape circuit of the FlyWire connectome)...', flush=True)
+    brain = start('brain', ['bash', str(HERE.parent / 'flybrain' / 'py.sh'), '-u', 'brain_server.py'])
+    deadline = time.monotonic() + timeout
+    while 'ready' not in (LOG_DIR / 'brain.log').read_text(errors='replace'):
+        if brain.poll() is not None:
+            sys.exit(f'The fly brain exited during startup. Last lines of logs/brain.log:\n{log_tail("brain")}')
+        if time.monotonic() > deadline:
+            sys.exit(f'The fly brain did not start within {timeout:.0f} s; see logs/brain.log')
+        time.sleep(0.5)
+    print(log_tail('brain', 1), flush=True)
+    return brain
 
 
 def scene_for(script: str | None, script_args: list[str]) -> str:
@@ -93,7 +120,7 @@ def check_gpu():
 
 
 def wait_for_sim(sim: subprocess.Popen, timeout: float = 90.0):
-    print('Starting CrazySim (MuJoCo window will open)...', flush=True)
+    print('Starting CrazySim...', flush=True)
     deadline = time.monotonic() + timeout
     while not sim_is_up(SIM_URI):
         if sim.poll() is not None:
@@ -150,11 +177,19 @@ def main():
     ap.add_argument('flight', nargs='?', choices=sorted(FLIGHTS), help='flight to run once the sim is up')
     ap.add_argument('--camera-window', action='store_true',
                     help='also open the separate camera view window (its fps readout checks the AI-deck stream)')
+    ap.add_argument('--headless', action='store_true',
+                    help='no windows at all: no 3D view, no dashboard (test runs while the PC is used for '
+                         'something else; the flight and its log are the same)')
+    ap.add_argument('--screen', default='auto',
+                    help='where the windows open: auto (a screen other than the main one, if there is one), '
+                         'main, a number (1 = main), or off (wherever they open)')
     args, script_args = ap.parse_known_args()
     if script_args and not args.flight:
         ap.error(f'unrecognized arguments: {" ".join(script_args)}')
     script, dashboard, default_args = FLIGHTS[args.flight] if args.flight else (None, None, [])
     script_args = default_args + script_args
+    if args.headless and args.camera_window:
+        ap.error('--headless opens no windows: drop --camera-window')
     if args.camera_window and dashboard is not None:
         ap.error(f'--camera-window cannot be combined with {args.flight}: the camera bridge serves one client, '
                  'and the avoidance demo needs it')
@@ -166,15 +201,27 @@ def main():
         signal.signal(sig, _interrupt)
     stop_leftovers()
     procs = []
+    placer = None
+    if not args.headless:
+        monitor = screens.pick(args.screen)
+        if monitor is not None and screens.WindowPlacer.available():
+            placer = screens.WindowPlacer(monitor)
+            placer.start()
+            print(f'Windows open on the {monitor.width} x {monitor.height} screen (--screen {args.screen}).', flush=True)
     try:
         scene = scene_for(script, script_args)
         if scene != 'obstacles':
             print(f'Scene: {scene} ({SCENES[scene].name})', flush=True)
-        sim = start('sim', ['bash', 'run_sim.sh'], env={'SCENE': str(SCENES[scene])})
+        sim_env = {'SCENE': str(SCENES[scene])}
+        if args.headless:
+            sim_env['CRAZYSIM_HEADLESS'] = '1'  # CrazySim's launch script then leaves out the viewer (our patch)
+        sim = start('sim', ['bash', 'run_sim.sh'], env=sim_env)
         procs.append(sim)
         wait_for_sim(sim)
-        if dashboard is not None:
+        if dashboard is not None and not args.headless:
             procs.append(start('dashboard', [sys.executable, 'dashboard.py', *dashboard, '--scene', str(SCENES[scene])]))
+        if uses_brain(script_args):
+            procs.append(start_brain())
         if args.camera_window:
             camera = start('camera', [sys.executable, 'camera_view.py'])
             procs.append(camera)
@@ -182,12 +229,15 @@ def main():
                 wait_for_camera(camera)
         if script and run_flight(script, script_args, sim):
             return
-        print('Running. Close the MuJoCo window or press Ctrl-C to shut everything down.', flush=True)
+        print('Running. Press Ctrl-C to shut everything down.' if args.headless else
+              'Running. Close the MuJoCo window or press Ctrl-C to shut everything down.', flush=True)
         while sim.poll() is None:
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
+        if placer is not None:
+            placer.stop()
         print('Shutting down...', flush=True)
         for proc in reversed(procs):
             stop(proc)

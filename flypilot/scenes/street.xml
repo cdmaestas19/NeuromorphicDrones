@@ -1,13 +1,19 @@
 <mujoco model="Street scene with people and a cart">
-  <!-- flypilot's moving-obstacle scene: the same 6 x 6 m room as CrazySim's scene_obstacles.xml, with a
-       walkway (east-west, y 1.0..1.6) and a road (north-south, x 1.2..2.0). The movers are mocap bodies:
+  <!-- flypilot's moving-obstacle scene: a 12 x 12 m courtyard with a walkway (east-west, y 2..4) and a
+       road (north-south, x 1.5..4.5) that cross at a zebra crossing. The movers are mocap bodies:
        crazysim.py's MoverDriver moves them as flypilot/movers.py commands; until then they are parked
-       beside their paths. The drone takes off at (0, 0). Markings are visual only (no contacts, too flat
-       for the horizontal range rays). Static obstacles are geoms directly in worldbody: planner.py maps
-       those and ignores mover bodies. -->
+       at the start of their paths. The drone takes off at (0, 0). Markings are visual only (no contacts,
+       too flat for the horizontal range rays). Static obstacles are geoms directly in worldbody:
+       planner.py maps those and ignores mover bodies. The geofence follows the walls (planner.geofence).
+       Deliveries cruise at 4.5 m (routes.DELIVERY_CRUISE_M), above the people and the cart: up there the
+       hazards are what is tall. The walls are 8 m buildings; the streetlight (6 m, with its arm), the tree
+       canopies (3.3-5.7 m) and building1 (7 m) are at cruise height; new_pole1 (6 m) went up after the
+       map was made (not on the "building" map), on the poles route's path. -->
+  <!-- Down at 0.5 m the old footprints are unchanged; building1 and new_pole1 stand off the low-level
+       tests' paths. -->
   <option integrator="RK4" density="1.225" viscosity="1.8e-5" timestep="0.001"/>
   <compiler inertiafromgeom="false" autolimits="true"/>
-  <statistic center="0 0 1" extent="3"/>
+  <statistic center="0 0 1" extent="6"/>
 
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.5 0.5 0.5" specular="0 0 0"/>
@@ -25,10 +31,15 @@
     <material name="walkway" rgba="0.72 0.7 0.66 1"/>
     <material name="road" rgba="0.2 0.2 0.22 1"/>
     <material name="paint" rgba="0.95 0.85 0.3 1"/>
+    <material name="zebra" rgba="0.92 0.92 0.92 1"/>
     <material name="trunk" rgba="0.45 0.3 0.2 1"/>
+    <material name="leaves" rgba="0.25 0.5 0.25 1"/>
+    <material name="post" rgba="0.25 0.25 0.28 1"/>
     <material name="obstacle" rgba="0.4 0.5 0.4 1"/>
+    <material name="kiosk" rgba="0.55 0.45 0.35 1"/>
     <material name="clothes1" rgba="0.2 0.35 0.75 1"/>
     <material name="clothes2" rgba="0.75 0.3 0.25 1"/>
+    <material name="clothes3" rgba="0.3 0.6 0.35 1"/>
     <material name="skin" rgba="0.85 0.68 0.55 1"/>
     <material name="cart" rgba="0.85 0.15 0.15 1"/>
     <material name="glass" rgba="0.6 0.75 0.85 1"/>
@@ -38,39 +49,66 @@
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
-    <geom name="wall_north" type="box" size="3 0.05 2" pos="0 3 1" material="wall"/>
-    <geom name="wall_south" type="box" size="3 0.05 2" pos="0 -3 1" material="wall"/>
-    <geom name="wall_east" type="box" size="0.05 3 2" pos="3 0 1" material="wall"/>
-    <geom name="wall_west" type="box" size="0.05 3 2" pos="-3 0 1" material="wall"/>
+    <geom name="wall_north" type="box" size="6 0.05 4" pos="0 6 4" material="wall"/>
+    <geom name="wall_south" type="box" size="6 0.05 4" pos="0 -6 4" material="wall"/>
+    <geom name="wall_east" type="box" size="0.05 6 4" pos="6 0 4" material="wall"/>
+    <geom name="wall_west" type="box" size="0.05 6 4" pos="-6 0 4" material="wall"/>
 
     <!-- Markings (visual only) -->
-    <geom name="mark_walkway" type="box" size="2.95 0.3 0.002" pos="0 1.3 0.002" material="walkway" contype="0" conaffinity="0"/>
-    <geom name="mark_road" type="box" size="0.4 2.95 0.002" pos="1.6 0 0.003" material="road" contype="0" conaffinity="0"/>
-    <geom name="mark_line1" type="box" size="0.02 0.2 0.002" pos="1.6 -2.4 0.005" material="paint" contype="0" conaffinity="0"/>
-    <geom name="mark_line2" type="box" size="0.02 0.2 0.002" pos="1.6 -1.6 0.005" material="paint" contype="0" conaffinity="0"/>
-    <geom name="mark_line3" type="box" size="0.02 0.2 0.002" pos="1.6 -0.8 0.005" material="paint" contype="0" conaffinity="0"/>
-    <geom name="mark_line4" type="box" size="0.02 0.2 0.002" pos="1.6 0.0 0.005" material="paint" contype="0" conaffinity="0"/>
-    <geom name="mark_line5" type="box" size="0.02 0.2 0.002" pos="1.6 0.8 0.005" material="paint" contype="0" conaffinity="0"/>
-    <geom name="mark_line6" type="box" size="0.02 0.2 0.002" pos="1.6 2.4 0.005" material="paint" contype="0" conaffinity="0"/>
+    <geom name="mark_walkway" type="box" size="5.95 1.0 0.002" pos="0 3 0.002" material="walkway" contype="0" conaffinity="0"/>
+    <geom name="mark_road" type="box" size="1.5 5.95 0.002" pos="3 0 0.003" material="road" contype="0" conaffinity="0"/>
+    <geom name="mark_line1" type="box" size="0.04 0.4 0.002" pos="3 -5.0 0.005" material="paint" contype="0" conaffinity="0"/>
+    <geom name="mark_line2" type="box" size="0.04 0.4 0.002" pos="3 -3.5 0.005" material="paint" contype="0" conaffinity="0"/>
+    <geom name="mark_line3" type="box" size="0.04 0.4 0.002" pos="3 -2.0 0.005" material="paint" contype="0" conaffinity="0"/>
+    <geom name="mark_line4" type="box" size="0.04 0.4 0.002" pos="3 -0.5 0.005" material="paint" contype="0" conaffinity="0"/>
+    <geom name="mark_line5" type="box" size="0.04 0.4 0.002" pos="3 1.0 0.005" material="paint" contype="0" conaffinity="0"/>
+    <geom name="mark_line6" type="box" size="0.04 0.4 0.002" pos="3 5.0 0.005" material="paint" contype="0" conaffinity="0"/>
+    <geom name="mark_zebra1" type="box" size="0.15 0.9 0.002" pos="1.8 3 0.005" material="zebra" contype="0" conaffinity="0"/>
+    <geom name="mark_zebra2" type="box" size="0.15 0.9 0.002" pos="2.4 3 0.005" material="zebra" contype="0" conaffinity="0"/>
+    <geom name="mark_zebra3" type="box" size="0.15 0.9 0.002" pos="3.0 3 0.005" material="zebra" contype="0" conaffinity="0"/>
+    <geom name="mark_zebra4" type="box" size="0.15 0.9 0.002" pos="3.6 3 0.005" material="zebra" contype="0" conaffinity="0"/>
+    <geom name="mark_zebra5" type="box" size="0.15 0.9 0.002" pos="4.2 3 0.005" material="zebra" contype="0" conaffinity="0"/>
 
     <!-- Static obstacles, off the walkway and the road -->
-    <geom name="tree1" type="cylinder" size="0.15 1" pos="-1.4 -1.4 1" material="trunk"/>
-    <geom name="bench1" type="box" size="0.5 0.15 0.25" pos="-1.6 2.1 0.25" material="obstacle"/>
-    <geom name="crate1" type="box" size="0.25 0.25 0.3" pos="2.5 -1.9 0.3" material="obstacle"/>
+    <geom name="tree1" type="cylinder" size="0.2 1.65" pos="-3.5 -2.5 1.65" material="trunk"/>
+    <geom name="tree1_canopy" type="cylinder" size="1.2 1.2" pos="-3.5 -2.5 4.5" material="leaves"/>
+    <geom name="tree2" type="cylinder" size="0.2 1.65" pos="-1.0 4.8 1.65" material="trunk"/>
+    <geom name="tree2_canopy" type="cylinder" size="1.2 1.2" pos="-1.0 4.8 4.5" material="leaves"/>
+    <geom name="lamp1" type="cylinder" size="0.08 3.0" pos="1.2 1.7 3.0" material="post"/>
+    <geom name="lamp1_arm" type="box" size="0.04 0.6 0.04" pos="1.2 2.3 5.9" material="post"/>
+    <geom name="building1" type="box" size="0.5 0.4 3.5" pos="-1.5 -3.3 3.5" material="wall"/>
+    <geom name="new_pole1" type="cylinder" size="0.12 3.0" pos="1.0 -0.6 3.0" material="post"/>
+    <geom name="bench1" type="box" size="0.6 0.2 0.25" pos="-3.0 4.5 0.25" material="obstacle"/>
+    <geom name="bench2" type="box" size="0.6 0.2 0.25" pos="-2.0 1.5 0.25" material="obstacle"/>
+    <geom name="kiosk1" type="box" size="0.6 0.6 1.0" pos="-4.5 -1.6 1.0" material="kiosk"/>
+    <geom name="crate1" type="box" size="0.3 0.3 0.3" pos="5.2 -4.0 0.3" material="obstacle"/>
+    <geom name="crate2" type="box" size="0.3 0.3 0.3" pos="-4.8 -4.8 0.3" material="obstacle"/>
+    <!-- by the south wall, on the wallside route's path; not on the "building" map -->
+    <geom name="crate3" type="box" size="0.25 0.25 0.5" pos="0.0 -5.0 0.5" material="obstacle"/>
 
-    <!-- Movers (mocap). People: 1.7 m tall, 0.18 m body radius. The cart stands in for a car at this
-         room's scale: 0.5 m wide, 0.8 m long, 0.6 m tall, long axis along y (it drives along the road). -->
-    <body name="person1" mocap="true" pos="-2.6 1.3 0.86">
+    <!-- Movers (mocap). People: 1.7 m tall, 0.18 m body radius. The cart is golf-cart sized: 1.2 m wide,
+         2.2 m long, 1.5 m tall, long axis along y (it drives along the road).
+         Each needs its own <inertial>: with inertiafromgeom="false" a mover has none, and once MoverDriver
+         turns it, mj_multiRay (the compound eye) stops seeing it (mj_ray, the range sensors, still does). -->
+    <body name="person1" mocap="true" pos="-5.5 3.0 0.86">
+      <inertial pos="0 0 0" mass="70" diaginertia="10 10 1"/>
       <geom name="person1_body" type="capsule" size="0.18 0.55" pos="0 0 -0.1" material="clothes1"/>
       <geom name="person1_head" type="sphere" size="0.11" pos="0 0 0.7" material="skin"/>
     </body>
-    <body name="person2" mocap="true" pos="2.6 1.3 0.86">
+    <body name="person2" mocap="true" pos="-5.4 0.6 0.86">
+      <inertial pos="0 0 0" mass="70" diaginertia="10 10 1"/>
       <geom name="person2_body" type="capsule" size="0.18 0.55" pos="0 0 -0.1" material="clothes2"/>
       <geom name="person2_head" type="sphere" size="0.11" pos="0 0 0.7" material="skin"/>
     </body>
-    <body name="cart1" mocap="true" pos="1.6 -2.5 0.36">
-      <geom name="cart1_body" type="box" size="0.25 0.4 0.24" material="cart"/>
-      <geom name="cart1_cabin" type="box" size="0.22 0.18 0.06" pos="0 -0.05 0.3" material="glass"/>
+    <body name="person3" mocap="true" pos="-4.0 -5.3 0.86">
+      <inertial pos="0 0 0" mass="70" diaginertia="10 10 1"/>
+      <geom name="person3_body" type="capsule" size="0.18 0.55" pos="0 0 -0.1" material="clothes3"/>
+      <geom name="person3_head" type="sphere" size="0.11" pos="0 0 0.7" material="skin"/>
+    </body>
+    <body name="cart1" mocap="true" pos="3.0 -4.6 0.6">
+      <inertial pos="0 0 0" mass="400" diaginertia="200 200 200"/>
+      <geom name="cart1_body" type="box" size="0.6 1.1 0.45" material="cart"/>
+      <geom name="cart1_cabin" type="box" size="0.55 0.5 0.22" pos="0 -0.15 0.67" material="glass"/>
     </body>
   </worldbody>
 </mujoco>

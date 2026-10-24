@@ -64,5 +64,8 @@ cmake ..  # the venv is active, so the build's bare `python` call resolves
 # Only the firmware binary: `make all` also builds the Gazebo plugin, which fails without Gazebo installed.
 make -j"$(nproc)" cf2
 
+echo "== Fly brain (flybrain/setup_brain.sh)"
+bash "$HERE/../flybrain/setup_brain.sh"
+
 echo
 echo "Setup complete. Next: launch.cmd (Windows) or 'bash py.sh launch.py' (Linux); see run.txt."

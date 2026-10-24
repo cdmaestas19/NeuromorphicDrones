@@ -46,9 +46,17 @@ These milestones describe our intended direction and will be updated as developm
 - **An obstacle-avoidance demo** driven by the Multi-ranger range sensors. A geometric time-to-collision rule feeds an explicit NOMINAL/AVOID state machine with hysteresis and a minimum dwell, so the drone doesn't chatter near obstacles.
 - **Path planning on a map**, for every flight: the drone routes around the obstacles its map knows about. Anything not on the map is left to the avoidance layer, which is where the fly brain will act.
 - **Delivery stops chosen during the flight** (`flypilot\launch.cmd deliver`): add stops by clicking a map in the "Delivery stops" window, the way a customer would place an order.
-- **Moving obstacles**: a street scene with people walking and a cart driving, in repeatable encounter tests that report the closest approach and any contact. The current rule-based avoidance handles people walking straight at the drone. It is touched by ones crossing from the side, which is where the fly brain should do better.
-- **A single swappable decision interface** (`AvoidancePolicy`), where the looming-detector and connectome policies will plug in. The avoidance is currently geometric; no spiking-network code exists yet.
-- **Decision-cost measurement and a record-and-replay benchmark**, so compute cost stays visible as the fly-brain components are added.
+- **Moving obstacles**: a street scene with people walking and a cart driving, in repeatable encounter tests that report the closest approach and any contact.
+- **A single swappable decision interface** (`AvoidancePolicy`), behind which the geometric rule and the fly brain both run.
+- **Decision-cost measurement and a record-and-replay benchmark**, so compute cost stays visible.
+
+**The fly brain flies the drone (policy `flybrain`): done, in simulation.** See [flybrain/README.md](flybrain/README.md).
+
+- A 360-degree compound eye in the simulator feeds the looming detectors (LC4, LPLC2) of a 3,118-neuron escape subcircuit cut from the FlyWire connectome (Dorkenwald et al. 2024, CC-BY 4.0; cell types from Schlegel et al. 2024, CC-BY 4.0), run with the Shiu et al. 2024 LIF model (MIT) in Brian2. The giant fibers decide when to escape; its steering descending neurons, the eye's collision geometry and the planner's map decide which way.
+- Checked against the published model (sugar -> MN9 within 10%; looming -> giant fiber in the whole brain) and the cut circuit against the whole brain.
+- Round a person, never over; up over a vehicle. What a threat is comes from the eye's size of it and a small camera CNN.
+- Deliveries cruise at 4.5 m and come down carefully at each stop.
+- **First comparison** (11 test routes): the fly brain had no contacts in 22 flights; the four-ray geometric rule touched the person or the cart on 5 routes. The two don't have the same senses yet (360-degree eye vs four rays), so this compares sensor sets as much as deciders. Giving the other arms the same eye is next.
 
 Setup, run order and troubleshooting: [flypilot/README.md](flypilot/README.md). Test checklist for a new PC: [flypilot/run.txt](flypilot/run.txt).
 

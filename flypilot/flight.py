@@ -32,13 +32,17 @@ SUP_CAN_FLY, SUP_IS_FLYING, SUP_TUMBLED, SUP_LOCKED, SUP_CRASHED = 0x08, 0x10, 0
 RANGE_MAX_M = 4.0         # Multi-ranger (VL53L1x) max range; CrazySim reports 4.0 m when nothing is hit
 RANGE_DIRECTIONS = ('front', 'back', 'left', 'right', 'up')
 
-# scene_obstacles.xml is a 6 x 6 m room (walls at +-3 m); stay well inside it and below 1.4 m.
+# scene_obstacles.xml is a 6 x 6 m room (walls at +-3 m); stay well inside it and below 1.4 m. Other scenes
+# get theirs from planner.geofence(scene), passed to fly_mission().
 GEOFENCE = {'x': (-2.6, 2.6), 'y': (-2.6, 2.6), 'z': (-0.2, 1.4)}
 
 CONNECT_ATTEMPTS = 3
 TELEMETRY_PERIOD_MS = 50
 TELEMETRY_STALE_S = 0.5
 LEASH_M = 0.35            # how far the setpoint may run ahead of the drone before it waits
+TOUCHDOWN_S = 1.0         # land(): not descending for this long at the bottom of the descent is touchdown
+LEASH_Z_M = 0.5           # ...vertically, in velocity mode. The firmware's position gain (2/s) turns the lead into
+                          # speed: 0.35 m held a climb to ~0.7 m/s, 0.5 m allows its 1 m/s limit (over a cart)
 
 
 class SafetyStop(Exception):
@@ -236,11 +240,12 @@ class Pilot:
     dashboard), including during takeoff, turns and landing.
     """
 
-    def __init__(self, link: Link, rate_hz: float = 20.0):
+    def __init__(self, link: Link, rate_hz: float = 20.0, geofence: dict = GEOFENCE):
         self.link = link
         self.cf = link.cf
         self.tm = link.telemetry
         self.dt = 1.0 / rate_hz
+        self.geofence = geofence
         self.flying = False
         self.on_tick: Callable[[], None] | None = None
         s = self.tm.state()
@@ -301,11 +306,14 @@ class Pilot:
 
     def step_velocity(self, velocity, yaw_deg: float | None = None, yaw_rate: float = 90.0):
         """One tick in velocity mode: move the setpoint by velocity * dt (world frame, m/s) and turn
-        toward yaw_deg (None holds the heading). The setpoint stays leashed to the drone."""
-        pos = self.tm.state().position
+        toward yaw_deg (None holds the heading). The setpoint stays leashed to the drone, horizontally and
+        vertically apart: the drone lags most in a climb, and that mustn't hold up a sideways escape."""
+        pos = np.asarray(self.tm.state().position, float)
         step = np.array(self.setpoint[:3]) + np.asarray(velocity, float) * self.dt
-        if np.linalg.norm(step - pos) <= LEASH_M:
-            self.setpoint[:3] = step.tolist()
+        if np.linalg.norm(step[:2] - pos[:2]) <= LEASH_M:
+            self.setpoint[:2] = step[:2].tolist()
+        if abs(step[2] - pos[2]) <= LEASH_Z_M:
+            self.setpoint[2] = float(step[2])
         if yaw_deg is not None:
             err = wrap_deg(yaw_deg - self.setpoint[3])
             limit = yaw_rate * self.dt
@@ -319,15 +327,33 @@ class Pilot:
         self.setpoint[:3] = [s.x, s.y, self.setpoint[2]]
 
     def land(self, speed: float = 0.25):
+        """Down at `speed` to the floor, motors off once it has touched down: below 0.08 m, or no longer
+        descending for TOUCHDOWN_S (resting on something: an emergency landing comes down where it is,
+        and that may be on a crate). The wait for that scales with the height left to come down."""
         log.info('landing at (%.2f, %.2f)', self.setpoint[0], self.setpoint[1])
         while self.setpoint[2] > 0.05:
             self.setpoint[2] = max(0.05, self.setpoint[2] - speed * self.dt)
             self.tick()
+        resting = {'since': None}
+
+        def down(st: State) -> bool:
+            if st.z < 0.08:
+                return True
+            if abs(st.vz) > 0.05:
+                resting['since'] = None
+            elif resting['since'] is None:
+                resting['since'] = time.monotonic()
+            return resting['since'] is not None and time.monotonic() - resting['since'] >= TOUCHDOWN_S
+
         try:
-            self._settle(lambda st: st.z < 0.08, 'touchdown', timeout=3.0)
+            self._settle(down, 'touchdown', timeout=3.0 + self.tm.state().z / speed)
         finally:
             self.motors_off()
-        log.info('landed')
+        z = self.tm.state().z
+        if z < 0.08:
+            log.info('landed')
+        else:
+            log.info('landed on something %.2f m up', z)
 
     def motors_off(self):
         self.cf.commander.send_stop_setpoint()
@@ -384,7 +410,7 @@ class Pilot:
             raise SafetyStop(f'no telemetry for {time.monotonic() - s.stamp:.1f} s')
         if s.supervisor & (SUP_TUMBLED | SUP_CRASHED):
             raise SafetyStop(f'supervisor reports {"crashed" if s.supervisor & SUP_CRASHED else "tumbled"}')
-        for axis, (lo, hi) in GEOFENCE.items():
+        for axis, (lo, hi) in self.geofence.items():
             v = getattr(s, axis)
             if not lo <= v <= hi:
                 raise SafetyStop(f'geofence: {axis}={v:.2f} m outside [{lo}, {hi}]')
@@ -395,7 +421,7 @@ def setup_logging():
                         datefmt='%H:%M:%S')
 
 
-def fly_mission(mission: Callable[[Pilot], None], uri: str = SIM_URI) -> int:
+def fly_mission(mission: Callable[[Pilot], None], uri: str = SIM_URI, geofence: dict = GEOFENCE) -> int:
     """Connect, run mission(pilot), and land on any interruption. Returns a process exit code.
 
     First Ctrl-C lands where the drone is; a second Ctrl-C during that landing cuts the motors.
@@ -406,7 +432,7 @@ def fly_mission(mission: Callable[[Pilot], None], uri: str = SIM_URI) -> int:
         log.error('not flying: %s', e or 'interrupted')
         return 1
     with link:
-        pilot = Pilot(link)
+        pilot = Pilot(link, geofence=geofence)
         try:
             mission(pilot)
             return 0

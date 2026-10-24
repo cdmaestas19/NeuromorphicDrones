@@ -1,5 +1,5 @@
 diff --git a/simulator_files/mujoco/crazysim.py b/simulator_files/mujoco/crazysim.py
-index d4a7eb9..85d789d 100644
+index d4a7eb9..1fc8f89 100644
 --- a/simulator_files/mujoco/crazysim.py
 +++ b/simulator_files/mujoco/crazysim.py
 @@ -56,6 +56,7 @@ Multi-agent usage:
@@ -110,7 +110,7 @@ index d4a7eb9..85d789d 100644
          img_bytes = gray.tobytes()
  
          # Split into UDP chunks
-@@ -460,9 +510,301 @@ class CameraRenderer:
+@@ -460,9 +510,356 @@ class CameraRenderer:
                  pass
  
      def stop(self):
@@ -383,6 +383,61 @@ index d4a7eb9..85d789d 100644
 +                continue
 +
 +
++# ---------------------------------------------------------------------------
++# Compound eye: a ring of ommatidia around a drone, measuring distance (for flypilot's fly-brain policy)
++# ---------------------------------------------------------------------------
++EYE_PORT = int(os.environ.get('CRAZYSIM_EYE_PORT', '5330'))
++EYE_RATE_HZ = 20.0
++EYE_STEP_DEG = 5.0      # ommatidium spacing, as in a fly's eye
++EYE_ELEVATION_DEG = (-90, 30)  # rows from straight down to 30 degrees up: a fly sees below it too
++EYE_GRAZING_COS = 0.26  # hits more than ~75 degrees off the surface normal are reported as unknown (0)
++
++
++class CompoundEye:
++    """Every EYE_STEP_DEG all the way round and over EYE_ELEVATION_DEG, the distance from the drone to the
++    first thing in that direction (mj_multiRay; the drone itself excluded; RANGE_MAX_M if nothing). The
++    directions are level and world-aligned, azimuth 0 = world +x: a stabilized eye, so the drone's turning and
++    tilting don't sweep it across the scene. EYE_RATE_HZ times per simulated second it sends to
++    udp://127.0.0.1:EYE_PORT: b'CSE2', u16 n_az, u16 n_el, i16 lowest and highest elevation (degrees),
++    f64 sim time, f64 x, y, z, then n_el * n_az float16 distances, rows from the lowest elevation up, each row
++    from azimuth 0 counter-clockwise; 0 means unknown (a grazing hit, see maybe_cast)."""
++
++    def __init__(self, model: mujoco.MjModel, body_id: int):
++        self._body = body_id
++        az = np.radians(np.arange(0.0, 360.0, EYE_STEP_DEG))
++        el = np.radians(np.arange(EYE_ELEVATION_DEG[0], EYE_ELEVATION_DEG[1] + 0.1, EYE_STEP_DEG))
++        E, A = np.meshgrid(el, az, indexing='ij')
++        self._vec = np.stack([np.cos(E) * np.cos(A), np.cos(E) * np.sin(A), np.sin(E)], axis=-1).reshape(-1).copy()
++        self._n_az, self._n_el, self._n = len(az), len(el), E.size
++        self._geomid = np.zeros(self._n, np.int32)
++        self._dist = np.zeros(self._n, np.float64)
++        self._normal = np.zeros(3 * self._n, np.float64)
++        self._period, self._acc = 1.0 / EYE_RATE_HZ, 0.0
++        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
++        self._header = b'CSE2' + struct.pack('<HHhh', self._n_az, self._n_el, *EYE_ELEVATION_DEG)
++        print(f'[crazysim] compound eye: {self._n} ommatidia ({self._n_az} x {self._n_el}, {EYE_STEP_DEG:g} deg) '
++              f'-> udp://127.0.0.1:{EYE_PORT}')
++
++    def maybe_cast(self, model: mujoco.MjModel, data: mujoco.MjData, dt: float):
++        self._acc += dt
++        if self._acc < self._period:
++            return
++        self._acc -= self._period
++        pos = data.xpos[self._body]
++        mujoco.mj_multiRay(model, data, pos, self._vec, None, True, self._body, self._geomid, self._dist,
++                           self._normal, self._n, RANGE_MAX_M)
++        # A ray skimming a surface (e.g. a crate top at flying height) slides along it: a 1 cm bob moves the hit
++        # by ~10 cm, which reads as looming. Such grazing hits are reported as 0 (unknown) instead.
++        facing = np.abs(np.einsum('ij,ij->i', self._normal.reshape(-1, 3), self._vec.reshape(-1, 3)))
++        d = np.where(self._dist < 0, RANGE_MAX_M, np.minimum(self._dist, RANGE_MAX_M))
++        d = np.where((self._dist >= 0) & (facing < EYE_GRAZING_COS), 0.0, d).astype(np.float16)
++        try:
++            self._sock.sendto(self._header + struct.pack('<dddd', data.time, *pos) + d.tobytes(),
++                              ('127.0.0.1', EYE_PORT))
++        except OSError:
++            pass
++
++
 +def _camera_eye(cam) -> list | None:
 +    """World position of the viewer's free or tracking camera (as mjv_cameraFrame computes it)."""
 +    if cam.type not in (mujoco.mjtCamera.mjCAMERA_FREE, mujoco.mjtCamera.mjCAMERA_TRACKING):
@@ -412,7 +467,7 @@ index d4a7eb9..85d789d 100644
  # ---------------------------------------------------------------------------
  # Directory containing this script — used to resolve scene.xml
  _HERE = os.path.dirname(os.path.abspath(__file__))
-@@ -985,35 +1327,31 @@ class DroneAgent:
+@@ -985,35 +1382,31 @@ class DroneAgent:
          return pos, q_xyzw
  
      def read_ranges(self) -> tuple[float, float, float, float, float]:
@@ -468,7 +523,7 @@ index d4a7eb9..85d789d 100644
  
          return tuple(ranges)
  
-@@ -1231,6 +1569,10 @@ class CrazySimMuJoCo:
+@@ -1231,6 +1624,10 @@ class CrazySimMuJoCo:
          # Build shared MuJoCo model with all drones
          self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
          self.model.opt.timestep = self.dt
@@ -479,23 +534,27 @@ index d4a7eb9..85d789d 100644
          self.data = mujoco.MjData(self.model)
  
          # Create per-drone agents
-@@ -1264,6 +1606,7 @@ class CrazySimMuJoCo:
+@@ -1264,6 +1661,8 @@ class CrazySimMuJoCo:
              )
              self.agents.append(agent)
  
 +        self._movers = MoverDriver(self.model)
++        self._eye = CompoundEye(self.model, self.agents[0]._body_id) if self.agents else None
          self._running = False
  
      def _apply_downwash(self):
-@@ -1314,6 +1657,7 @@ class CrazySimMuJoCo:
+@@ -1314,7 +1713,10 @@ class CrazySimMuJoCo:
                  agent.update_led_materials()
              if self._downwash and self.num_agents > 1:
                  self._apply_downwash()
 +            self._movers.apply(self.data)
              mujoco.mj_step(self.model, self.data)
++            if self._eye is not None:
++                self._eye.maybe_cast(self.model, self.data, self.dt)
              for agent in self.agents:
                  agent.send_sensor_data()
-@@ -1334,14 +1678,38 @@ class CrazySimMuJoCo:
+ 
+@@ -1334,14 +1736,38 @@ class CrazySimMuJoCo:
                  _rtf_wall_start = wall_now
                  _rtf_sim_start = self.data.time
  
@@ -534,7 +593,7 @@ index d4a7eb9..85d789d 100644
                  while v.is_running() and self._running:
                      t0 = time.perf_counter()
                      with v.lock():
-@@ -1355,29 +1723,17 @@ class CrazySimMuJoCo:
+@@ -1355,29 +1781,17 @@ class CrazySimMuJoCo:
                              _cam_init_frames -= 1
                      _update_rtf()
                      if t0 - _last_render >= _render_interval:
@@ -567,3 +626,16 @@ index d4a7eb9..85d789d 100644
              except KeyboardInterrupt:
                  pass
  
+diff --git a/simulator_files/mujoco/launch/sitl_camera.sh b/simulator_files/mujoco/launch/sitl_camera.sh
+index 872721d..5488cfd 100755
+--- a/simulator_files/mujoco/launch/sitl_camera.sh
++++ b/simulator_files/mujoco/launch/sitl_camera.sh
+@@ -76,7 +76,7 @@ echo "Connect with: python3 crazyflie-lib-python/examples/aideck/fpv.py tcp://12
+ python3 "$crazysim_dir/crazysim.py" \
+ 	--model-type "${model_type}" \
+ 	--port 19950 \
+-	--vis \
++	$( [ "${CRAZYSIM_HEADLESS:-0}" = 1 ] || echo --vis ) \
+ 	--camera \
+ 	${SENSOR_NOISE} \
+ 	${GROUND_EFFECT} \

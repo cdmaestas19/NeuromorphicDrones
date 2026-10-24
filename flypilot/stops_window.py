@@ -20,14 +20,13 @@ import numpy as np
 
 from dashboard import (BG, BLUE, DIM, GRAY, GREEN, GRID, MAGENTA, ORANGE, ORDER_COLORS, PANEL, RED, WHITE, YELLOW,
                        draw_markings, draw_movers, text)
-from flight import GEOFENCE
 from orders import KEEP_OUT_M, ORDERS_PORT, SELECT_RADIUS_M, obstacle_gap
 from planner import MAP_HELP, MAPS, Planner, on_map
 
 NAME = 'Delivery stops'
 W, H = 960, 620
-MAP = (10, 10, 600, 600)  # x, y, w, h of the map
-SPAN_M = 6.1              # metres across the map (the room is 6 x 6 m)
+MAP = (10, 10, 600, 600)  # x, y, w, h of the map: the room (planner.room) plus MARGIN_M round it
+MARGIN_M = 0.1
 PANEL_X = 625
 ROWS = 9                  # stop rows shown in the list
 ZONE = (52, 46, 46)       # BGR shade of the zones the planner keeps out of
@@ -37,8 +36,10 @@ class StopsWindow:
     def __init__(self, dash, altitude: float):
         self.dash, self.altitude = dash, altitude
         self.obstacles = [o for o in dash.obstacles if _spans(o, altitude)]
-        self.S = MAP[2] / SPAN_M
+        x0, x1, y0, y1 = dash.room
+        self.S = MAP[2] / (max(x1 - x0, y1 - y0) + 2 * MARGIN_M)
         self.cx, self.cy = MAP[0] + MAP[2] / 2, MAP[1] + MAP[3] / 2
+        self.mx, self.my = (x0 + x1) / 2, (y0 + y1) / 2  # the room's centre is the map's
         self._zones = {}
         self._buttons = []   # (x0, y0, x1, y1, request) rebuilt by every render
         self._hover = None   # world (x, y) under the mouse, when over the map
@@ -98,9 +99,11 @@ class StopsWindow:
         map_name = book['map'] if book else 'all'
         img[y:y + h, x:x + w] = self._zone_image(map_name)
         P = self._px
-        for k in range(-3, 4):
-            cv2.line(img, P(k, -3), P(k, 3), GRID, 1)
-            cv2.line(img, P(-3, k), P(3, k), GRID, 1)
+        x0, x1, y0, y1 = (round(v) for v in self.dash.room)
+        for k in range(x0, x1 + 1):
+            cv2.line(img, P(k, y0), P(k, y1), GRID, 1)
+        for k in range(y0, y1 + 1):
+            cv2.line(img, P(x0, k), P(x1, k), GRID, 1)
         for kind, pos, size, name in self.obstacles:
             mapped = on_map(name, map_name)
             color = (125, 150, 125) if mapped else ORANGE
@@ -132,6 +135,8 @@ class StopsWindow:
             else:
                 cv2.circle(img, p, 9, c, -1 if state == 'delivered' else 2, cv2.LINE_AA)
             text(img, str(n), (p[0] + 11, p[1] - 9), 0.5, c, 1)
+        for sx, sy in m.get('seen') or []:  # obstacles the avoidance met, now on the planner's map
+            cv2.circle(img, P(sx, sy), 3, ORANGE, -1)
         draw_movers(img, m.get('movers'), P, self.S)
         st = m['state']
         dp, yaw = P(st['x'], st['y']), math.radians(st['yaw'])
@@ -213,7 +218,7 @@ class StopsWindow:
         """The same keep-out rule the flight applies (it has the final say)."""
         if self._stop_at(x, y) is not None or math.dist((x, y), book['home']) < SELECT_RADIUS_M:
             return True, ''
-        (x0, x1), (y0, y1) = GEOFENCE['x'], GEOFENCE['y']
+        (x0, x1), (y0, y1) = self.dash.fence['x'], self.dash.fence['y']
         if not (x0 + 0.1 <= x <= x1 - 0.1 and y0 + 0.1 <= y <= y1 - 0.1):
             return False, 'outside'
         gap, name = obstacle_gap(x, y, self.altitude, self.obstacles)
@@ -232,9 +237,9 @@ class StopsWindow:
         Cached per map."""
         if map_name not in self._zones:
             x, y, w, h = MAP
-            planner = Planner(self.dash.obstacles, GEOFENCE, self.altitude, map_name)
+            planner = Planner(self.dash.obstacles, self.dash.fence, self.altitude, map_name)
             us, vs = np.meshgrid(np.arange(w) + x, np.arange(h) + y)
-            wx, wy = (us - self.cx) / self.S, (self.cy - vs) / self.S
+            wx, wy = self._world(us, vs)
             i = np.rint((wx - planner.x0) / 0.05).astype(int)
             j = np.rint((wy - planner.y0) / 0.05).astype(int)
             inside = (i >= 0) & (i < planner.nx) & (j >= 0) & (j < planner.ny)
@@ -249,10 +254,10 @@ class StopsWindow:
         return self._zones[map_name]
 
     def _px(self, wx: float, wy: float) -> tuple:
-        return int(round(self.cx + wx * self.S)), int(round(self.cy - wy * self.S))
+        return int(round(self.cx + (wx - self.mx) * self.S)), int(round(self.cy - (wy - self.my) * self.S))
 
-    def _world(self, px: int, py: int) -> tuple:
-        return (px - self.cx) / self.S, (self.cy - py) / self.S
+    def _world(self, px, py) -> tuple:
+        return self.mx + (px - self.cx) / self.S, self.my + (self.cy - py) / self.S
 
 
 def _spans(obstacle, z: float) -> bool:

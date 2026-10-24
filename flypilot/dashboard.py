@@ -23,7 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from planner import SCENE, load_markings, load_obstacles
+from planner import SCENE, geofence, load_markings, load_obstacles, room
 
 PORT = 5300
 OVERLAY_PATH = os.environ.get('CRAZYSIM_OVERLAY', '/dev/shm/crazysim_overlay.rgb')  # read by crazysim.py
@@ -115,7 +115,7 @@ def draw_movers(img, movers, P, scale: float, labels: bool = True):
 
 
 def fmt_m(d):
-    return '> 4 m' if d is None else f'{d:.2f} m'
+    return '> 4 m' if d is None or not math.isfinite(d) else f'{d:.2f} m'
 
 
 # --------------------------------------------------------------------------- the panel
@@ -124,6 +124,7 @@ class Dashboard:
     def __init__(self, scene: Path):
         self.obstacles = load_obstacles(scene)
         self.markings = load_markings(scene)
+        self.room, self.fence = room(scene), geofence(scene)
         self.msg = None
         self.last_rx = 0.0
         self.history = deque()           # (t, signal, ttc_signal, avoiding)
@@ -170,6 +171,14 @@ class Dashboard:
         if stale > 2.0:
             text(img, f'no data for {stale:.0f} s', (W - 150, 26), 0.45, ORANGE)
 
+    @staticmethod
+    def _brain_status(m) -> str:
+        info = m['info']
+        if info.get('brain_ok') is False:
+            return 'NOT ANSWERING'
+        gl, gr = info.get('gf_left'), info.get('gf_right')
+        return 'giant fibers L/R' if gl is None else f'giant fiber L {gl:.0f} R {gr:.0f} Hz'
+
     def _pipeline(self, img, m, rect):
         x, y, w, h = rect
         panel(img, rect, 'What is making the avoidance decision')
@@ -179,25 +188,46 @@ class Dashboard:
 
         def box(bx, by, bw, bh, label, sub, color, active):
             cv2.rectangle(img, (bx, by), (bx + bw, by + bh), color if active else DIM, 2 if active else 1)
-            text(img, label, (bx + 6, by + 15), 0.42, WHITE if active else GRAY)
-            text(img, sub, (bx + 6, by + 29), 0.37, color if active else DIM)
+            text(img, label, (bx + 6, by + 13), 0.4, WHITE if active else GRAY)
+            text(img, sub, (bx + 6, by + bh - 5), 0.34, color if active else DIM)
 
-        camera_sub = ('used' if 'camera' in inputs else 'not used') + fps_s if m['camera_streaming'] else 'no stream'
-        rows = [('Multi-ranger ToF', 'used by policy' if 'multiranger' in inputs else 'not used', 'multiranger' in inputs),
+        info = m['info']
+        notes = m['policy'].get('notes', {})
+        if not m['camera_streaming']:
+            camera_sub = 'no stream'
+        elif 'camera' not in inputs:
+            camera_sub = 'not used' + fps_s
+        else:  # what the camera made of the threat, or what it is there for
+            camera_sub = info.get('camera_kind') or notes.get('camera', 'used') + fps_s
+        if '360 eye' not in inputs:
+            eye_sub = 'not used'
+        elif 'loom_left' in info:
+            eye_sub = f'looming L {info["loom_left"]:.1f} R {info["loom_right"]:.1f} /s'
+        else:
+            eye_sub = f'used, nearest {fmt_m(m.get("clearance"))}'
+        ranger_sub = notes.get('multiranger', 'used by policy') if 'multiranger' in inputs else 'not used'
+        rows = [('Multi-ranger ToF', ranger_sub, 'multiranger' in inputs),
                 ('AI-deck camera', camera_sub, 'camera' in inputs),
-                ('Fly brain', 'not connected yet', False)]
+                ('360 compound eye', eye_sub, '360 eye' in inputs),
+                ('Fly brain', self._brain_status(m) if 'fly brain' in inputs else 'not used', 'fly brain' in inputs)]
         mid = y + 80
         for i, (label, sub, used) in enumerate(rows):
-            by = y + 26 + i * 37
-            box(x + 8, by, 150, 34, label, sub, GREEN, used)
-            cv2.arrowedLine(img, (x + 158, by + 17), (x + 183, mid), GREEN if used else DIM, 1, tipLength=0.15)
+            by = y + 22 + i * 29
+            box(x + 8, by, 160, 27, label, sub, GREEN, used)
+            cv2.arrowedLine(img, (x + 168, by + 13), (x + 183, mid), GREEN if used else DIM, 1, tipLength=0.15)
+        if 'map' in inputs:  # the planner's map, into the policy from above: which way round is shorter
+            chose = info.get('side_from') == 'map'
+            box(x + 185, y + 22, 140, 28, 'Route map', 'chose the side' if chose else notes.get('map', 'used'),
+                YELLOW if chose else GREEN, True)
+            cv2.arrowedLine(img, (x + 255, y + 50), (x + 255, mid - 23), GREEN, 1, tipLength=0.4)
         mode_col = RED if m['mode'] == 'AVOID' else GREEN
         box(x + 185, mid - 22, 140, 44, 'Policy', m['policy']['name'], ORANGE, True)
         cv2.arrowedLine(img, (x + 325, mid), (x + 340, mid), WHITE, 1, tipLength=0.3)
         box(x + 342, mid - 22, 100, 44, 'Supervisor', m['mode'], mode_col, True)
         cv2.arrowedLine(img, (x + 442, mid), (x + 456, mid), WHITE, 1, tipLength=0.3)
         box(x + 458, mid - 22, w - 466, 44, 'Firmware', 'PID control', CYAN, True)
-        text(img, 'the resume gate also reads Multi-ranger clearance', (x + 185, mid + 42), 0.36, DIM)
+        text(img, 'the resume gate also reads the clearance ahead and aside (eye)' if m.get('eye_ring') is not None
+             else 'the resume gate also reads Multi-ranger clearance', (x + 185, mid + 42), 0.36, DIM)
 
     def _mode(self, img, m, rect):
         x, y, w, h = rect
@@ -271,15 +301,18 @@ class Dashboard:
             panel(img, rect, f'Top view: {todo} to go, {done} delivered')
         else:
             panel(img, rect, 'Top view (1 m grid)')
-        S = (w - 8) / 6.4
+        rx0, rx1, ry0, ry1 = self.room
+        S = min((w - 8) / (rx1 - rx0 + 0.5), (h - 12) / (ry1 - ry0 + 0.5))
         cx, cy = x + w / 2, y + 12 + (h - 12) / 2
+        mx, my = (rx0 + rx1) / 2, (ry0 + ry1) / 2
 
         def P(wx, wy):
-            return int(round(cx + wx * S)), int(round(cy - wy * S))
+            return int(round(cx + (wx - mx) * S)), int(round(cy - (wy - my) * S))
 
-        for k in range(-3, 4):
-            cv2.line(img, P(k, -3), P(k, 3), GRID, 1)
-            cv2.line(img, P(-3, k), P(3, k), GRID, 1)
+        for k in range(round(rx0), round(rx1) + 1):
+            cv2.line(img, P(k, round(ry0)), P(k, round(ry1)), GRID, 1)
+        for k in range(round(ry0), round(ry1) + 1):
+            cv2.line(img, P(round(rx0), k), P(round(rx1), k), GRID, 1)
         st = m['state']
         alt = st['z'] if st['z'] > 0.2 else 0.5
         draw_markings(img, self.markings, P)
@@ -292,6 +325,8 @@ class Dashboard:
             else:
                 cv2.circle(img, P(pos[0], pos[1]), max(2, int(size[0] * S)), color, fill)
 
+        for sx, sy in m.get('seen') or []:  # obstacles the avoidance met, now on the planner's map
+            cv2.circle(img, P(sx, sy), 2, ORANGE, -1)
         if book:
             self._stops(img, book, P)
         draw_movers(img, m.get('movers'), P, S, labels=False)
@@ -300,6 +335,9 @@ class Dashboard:
             cv2.line(img, P(x1, y1), P(x2, y2), RED if avoiding else GREEN, 2)
 
         px, py, yaw = st['x'], st['y'], math.radians(st['yaw'])
+        for az_w, d in m.get('eye_ring') or []:  # what the compound eye sees all round
+            a = math.radians(az_w)
+            cv2.circle(img, P(px + d * math.cos(a), py + d * math.sin(a)), 1, CYAN, -1)
         for ray, (f, l) in RAYS.items():
             ux, uy = f * math.cos(yaw) - l * math.sin(yaw), f * math.sin(yaw) + l * math.cos(yaw)
             d = m['ranges'].get(ray)
@@ -339,6 +377,8 @@ class Dashboard:
             text(img, str(n), P(x + 0.12, y + 0.12), 0.4, c)
 
     def _ranges(self, img, m, rect):
+        if m.get('eye_ring') is not None:
+            return self._surroundings(img, m, rect)
         x, y, w, h = rect
         panel(img, rect, 'Multi-ranger (body frame)')
         bx0, bx1 = x + 52, x + w - 58
@@ -358,6 +398,40 @@ class Dashboard:
         cv2.line(img, (clear_x, y + 30), (clear_x, y + 36 + 5 * 46 - 22), GRAY, 1)
         text(img, f'| = clearance radius {m["thresholds"]["clearance_m"]:.1f} m', (x + 8, y + h - 30), 0.37, GRAY)
         text(img, 'bar colour: green safe -> red threat', (x + 8, y + h - 10), 0.37, GRAY)
+
+    @staticmethod
+    def _surroundings(img, m, rect):
+        """What the compound eye sees all round at flying height, as a radar: the drone in the middle,
+        heading up, 1 m rings out to 4 m. The Multi-ranger's four rays are the thin gray lines."""
+        x, y, w, h = rect
+        panel(img, rect, 'All round (compound eye), heading up')
+        cx, cy = x + w // 2, y + 22 + (h - 62) // 2
+        S = (min(w, h - 62) / 2 - 6) / 4.0
+        clearance = m['thresholds']['clearance_m']
+        for r in (1, 2, 3, 4):
+            cv2.circle(img, (cx, cy), int(r * S), GRID, 1, cv2.LINE_AA)
+        cv2.circle(img, (cx, cy), int(clearance * S), DIM, 1, cv2.LINE_AA)
+        yaw = m['state']['yaw']
+
+        def P(az_body_deg, d):  # + azimuth = left of the heading; the heading points up
+            a = math.radians(az_body_deg)
+            return int(round(cx - math.sin(a) * d * S)), int(round(cy - math.cos(a) * d * S))
+
+        for ray, az in (('front', 0.0), ('left', 90.0), ('back', 180.0), ('right', -90.0)):
+            d = m['ranges'].get(ray)
+            cv2.line(img, (cx, cy), P(az, min(d, 4.0) if d is not None else 4.0), DIM, 1, cv2.LINE_AA)
+        for az_w, d in m['eye_ring']:
+            col = RED if d < clearance else ORANGE if d < 1.0 else GREEN
+            cv2.circle(img, P(az_w - yaw, d), 2, col, -1, cv2.LINE_AA)
+        info = m['info']
+        if info.get('worst_az') is not None and info.get('ttc_signal', 0.0) >= 0.25:
+            cv2.arrowedLine(img, P(info['worst_az'], 3.6), P(info['worst_az'], 1.2), threat_color(info['ttc_signal']),
+                            2, tipLength=0.25)
+        cv2.circle(img, (cx, cy), 4, WHITE, -1)
+        cv2.arrowedLine(img, (cx, cy), (cx, cy - 16), WHITE, 1, tipLength=0.35)
+        near = min((d for _, d in m['eye_ring']), default=None)
+        text(img, f'nearest {fmt_m(near)} all round; | ring = clearance {clearance:.1f} m', (x + 8, y + h - 28), 0.36, GRAY)
+        text(img, 'dots: what the eye sees; gray lines: Multi-ranger', (x + 8, y + h - 10), 0.36, GRAY)
 
 
 # --------------------------------------------------------------------------- outputs

@@ -16,6 +16,11 @@ the planner only needs the obstacle list.
 
 Planning runs when a leg starts and after an avoidance episode, never per control tick (one plan takes
 a few ms here). On a real Crazyflie it would run on the ground station, which already sends the setpoints.
+
+The map also helps the avoidance choose a side. With each leg's plan comes a cost-to-go field: how far
+the stop is from everywhere, around everything on the map (cost_field, ~10 ms). route_cost() then says
+how long the way to the stop is if the drone first escapes to some point: a policy compares going round
+a threat on the left with going round it on the right, and takes the shorter (policies.py).
 """
 import heapq
 import math
@@ -36,12 +41,16 @@ CELL_M = 0.05
 CLEARANCE_M = 0.3   # planned paths keep this far from mapped obstacles (stops need orders.KEEP_OUT_M = 0.35)
 EDGE_M = 0.1        # and this far inside the geofence
 MAPS = ('all', 'building', 'none')
-MAP_HELP = {'all': 'every obstacle is mapped', 'building': 'crates not mapped: avoidance must handle them',
+MAP_HELP = {'all': 'every obstacle is mapped', 'building': 'crates, new poles not mapped: avoidance handles them',
             'none': 'nothing mapped: straight lines'}
 
 _SQ2 = math.sqrt(2.0)
 _MOVES = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
           (1, 1, _SQ2), (1, -1, _SQ2), (-1, 1, _SQ2), (-1, -1, _SQ2))
+FIELD_STEP = 2      # the cost-to-go field uses every other grid cell (10 cm)
+_SQ5 = math.sqrt(5.0)
+_FIELD_MOVES = _MOVES + tuple((a * i, b * j, _SQ5) for i, j in ((1, 2), (2, 1)) for a in (1, -1) for b in (1, -1))
+DRONE_M = 0.1       # route_cost: an escape must keep this far from a mapped obstacle's surface
 
 
 def load_obstacles(path: Path = SCENE) -> list:
@@ -83,11 +92,42 @@ def load_markings(path: Path = SCENE) -> list:
     return out
 
 
+ROOM_WALLS = ('wall_west', 'wall_east', 'wall_south', 'wall_north')
+FENCE_INSET_M = 0.35  # the geofence stays this far inside the room's walls
+FENCE_Z = (-0.2, 1.4)  # without walls to go by
+CEILING_BELOW_TOP_M = 0.5  # the geofence's ceiling: this far below the top of the walls...
+CEILING_MAX_M = 6.0        # ...and no higher than this (cruising at 4.5 m above people and cars, with room to
+                           # climb out of trouble; CrazySim's room, 3 m walls, stays at 2.5 m)
+
+
+def room(path: Path = SCENE) -> tuple:
+    """(x0, x1, y0, y1): the floor inside the scene's walls, the box geoms named ROOM_WALLS. A 6 x 6 m room
+    if the scene has no such walls."""
+    walls = {name: (pos, size) for kind, pos, size, name in load_obstacles(path) if kind == 'box' and name in ROOM_WALLS}
+    if len(walls) < len(ROOM_WALLS):
+        return (-2.95, 2.95, -2.95, 2.95)
+    inner = lambda name, axis, sign: walls[name][0][axis] + sign * walls[name][1][axis]  # noqa: E731
+    return inner('wall_west', 0, 1), inner('wall_east', 0, -1), inner('wall_south', 1, 1), inner('wall_north', 1, -1)
+
+
+def geofence(path: Path = SCENE) -> dict:
+    """The flight geofence for a scene: FENCE_INSET_M inside its walls, and up to CEILING_BELOW_TOP_M below
+    their top (at most CEILING_MAX_M): +-2.6 m and 2.5 m in CrazySim's 6 x 6 m room, whose walls are 3 m
+    tall. (flight.GEOFENCE, for flights without a scene, keeps the old 1.4 m ceiling.)"""
+    x0, x1, y0, y1 = room(path)
+    m = FENCE_INSET_M
+    tops = [pos[2] + size[2] for kind, pos, size, name in load_obstacles(path) if kind == 'box' and name in ROOM_WALLS]
+    ceiling = min(min(tops) - CEILING_BELOW_TOP_M, CEILING_MAX_M) if len(tops) == len(ROOM_WALLS) else FENCE_Z[1]
+    return {'x': (round(x0 + m, 3), round(x1 - m, 3)), 'y': (round(y0 + m, 3), round(y1 - m, 3)),
+            'z': (FENCE_Z[0], round(ceiling, 3))}
+
+
 def on_map(name: str, map_name: str) -> bool:
-    """Whether the obstacle called `name` is on the planner's map `map_name`."""
+    """Whether the obstacle called `name` is on the planner's map `map_name`: 'building' leaves out the
+    clutter (crate*) and what went up after the map was made (new_*)."""
     if map_name == 'none':
         return False
-    return map_name == 'all' or not name.startswith('crate')
+    return map_name == 'all' or not name.startswith(('crate', 'new_'))
 
 
 class Planner:
@@ -104,6 +144,9 @@ class Planner:
         self._X, self._Y = np.meshgrid(xs, ys, indexing='ij')
         m = EDGE_M - 1e-6  # a stop exactly EDGE_M inside the fence is allowed (orders.FENCE_MARGIN_M)
         self._edge = ((self._X < self.x0 + m) | (self._X > x1 - m) | (self._Y < self.y0 + m) | (self._Y > y1 - m))
+        self.seen = np.zeros(self._edge.shape, bool)  # cells near obstacles the drone saw that aren't on the map
+        self.seen_points = []                          # [(x, y)]: what was added, for the top views
+        self._field = self._field_goal = None          # cost_field()
         self.set_map(map_name)
 
     # -- the map ------------------------------------------------------------------------------------
@@ -121,9 +164,88 @@ class Planner:
             else:
                 d = np.maximum(np.hypot(self._X - pos[0], self._Y - pos[1]) - size[0], 0.0)
             blocked |= d < CLEARANCE_M
-        self.blocked = blocked
-        self._flat = blocked.ravel().tolist()  # plain list: much faster to index in the A* loop
+        self._mapped_blocked = blocked
+        self._update_blocked()
+
+    def add_seen(self, points) -> int:
+        """Put an obstacle the drone saw (its surface points, world x, y) on the map: from now on paths keep
+        CLEARANCE_M from those points, as from a mapped obstacle. Returns the number of grid cells newly
+        blocked (0: already known)."""
+        before = int(self.seen.sum())
+        for x, y in points:
+            i0, i1 = self._cell(x - CLEARANCE_M, y - CLEARANCE_M), self._cell(x + CLEARANCE_M, y + CLEARANCE_M)
+            a0, a1 = max(i0[0], 0), min(i1[0] + 1, self.nx)
+            b0, b1 = max(i0[1], 0), min(i1[1] + 1, self.ny)
+            if a0 >= a1 or b0 >= b1:
+                continue
+            near = np.hypot(self._X[a0:a1, b0:b1] - x, self._Y[a0:a1, b0:b1] - y) < CLEARANCE_M
+            self.seen[a0:a1, b0:b1] |= near
+            self.seen_points.append((float(x), float(y)))
+        added = int(self.seen.sum()) - before
+        if added:
+            self._update_blocked()
+        return added
+
+    def _update_blocked(self):
+        self.blocked = self._mapped_blocked | self.seen
+        self._flat = self.blocked.ravel().tolist()  # plain list: much faster to index in the A* loop
         self._reach_from = self._reach = None
+        self._field = self._field_goal = None  # the map changed: the next leg's plan computes it again
+
+    # -- which way round: the cost-to-go field ------------------------------------------------------
+
+    def cost_field(self, goal: tuple):
+        """How far `goal` is from every cell (FIELD_STEP x CELL_M grid, 8 directions plus knight moves:
+        within a few % of straight-line lengths), around what is on the map; route_cost() reads it. Kept
+        until the goal or the map changes. ~10 ms on the street scene: computed with each leg's plan, never
+        while deciding."""
+        if self._field is not None and self._field_goal == goal:
+            return
+        k = FIELD_STEP
+        blocked = self.blocked[::k, ::k]
+        nx, ny = blocked.shape
+        f = np.full((nx, ny), np.inf)
+        gi, gj = (min(max(int(round(v)), 0), n - 1) for v, n in
+                  (((goal[0] - self.x0) / (CELL_M * k), nx), ((goal[1] - self.y0) / (CELL_M * k), ny)))
+        f[gi, gj] = 0.0
+        free = ~blocked
+        free[gi, gj] = True
+        r = 2  # the knight moves reach two cells
+        while True:
+            q = np.pad(f, r, constant_values=np.inf)
+            nxt = f
+            for di, dj, step in _FIELD_MOVES:
+                nxt = np.minimum(nxt, q[r + di: r + di + nx, r + dj: r + dj + ny] + step)
+            nxt = np.where(free, nxt, np.inf)
+            if np.array_equal(nxt, f):
+                break
+            f = nxt
+        self._field, self._field_goal = f * (CELL_M * k), goal
+
+    @property
+    def field_goal(self) -> tuple | None:
+        """The goal the cost-to-go field is for (None: none, or the map changed since)."""
+        return self._field_goal
+
+    def route_cost(self, x0: float, y0: float, x1: float, y1: float) -> float:
+        """The length of the way to the field's goal (cost_field) that starts with a straight escape from
+        (x0, y0) to (x1, y1): the escape, plus the shortest path on from where it ends. inf if the escape
+        runs into a mapped obstacle (within DRONE_M) or ends where the planner won't fly, or within DRONE_M
+        of it (within CLEARANCE_M of an obstacle, or by the fence: the end must have room for the drone, not
+        just its centre; wallside: an end 0.01 m inside the flyable area, beside the crate, was "free");
+        nan without a field."""
+        if self._field is None:
+            return math.nan
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d > 1e-6 and self.distance_ahead(x0, y0, (x1 - x0) / d, (y1 - y0) / d, d + DRONE_M) < d + DRONE_M:
+            return math.inf
+        return d + max(self._field_at(x1 + dx, y1 + dy) for dx, dy in
+                       ((0.0, 0.0), (DRONE_M, 0.0), (-DRONE_M, 0.0), (0.0, DRONE_M), (0.0, -DRONE_M)))
+
+    def _field_at(self, x: float, y: float) -> float:
+        i, j = (int(round((v - o) / (CELL_M * FIELD_STEP))) for v, o in ((x, self.x0), (y, self.y0)))
+        nx, ny = self._field.shape
+        return float(self._field[i, j]) if 0 <= i < nx and 0 <= j < ny else math.inf
 
     def distance_ahead(self, x: float, y: float, ux: float, uy: float, max_d: float) -> float:
         """Distance from (x, y) along the unit direction (ux, uy) to the first mapped obstacle surface

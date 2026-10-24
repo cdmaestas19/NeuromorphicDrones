@@ -1,0 +1,3 @@
+# The camera classifier's training environment (camera_train.sh). PyTorch itself is installed by that
+# script from the CPU-only index (the network has ~6 k weights; the CUDA build is ~2.5 GB more download).
+numpy>=1.24,<3
