@@ -129,9 +129,14 @@ rule. A negative result is an acceptable result.
     Ideal/geometric, not image-based.
   - `brain_server.py`: the escape subcircuit (paths <= 3 synapses from LC4/LPLC2
     to DNp01 + 35 other DNs, connections >= 5 synapses: 3,118 neurons) of the
-    Shiu et al. LIF model, one long Brian2 run stepped every 50 ms over UDP 5320;
-    integrates at 0.2 ms in flight (same GF response as 0.1 ms, half the
-    compute: ~5 ms per tick; several times that on a busy PC). Non-blocking both
+    Shiu et al. LIF model, stepped every 50 ms over UDP 5320; integrates at
+    0.2 ms in flight (same GF response as 0.1 ms). Engine `fast` (default):
+    `fastlif.c` via ctypes, the same network spike for spike (`check_fast.py`;
+    Brian2 drops input to refractory "(unless refractory)" variables, the C
+    does too; tiny values flushed to 0, subnormals cost 10x), ~2 ms per tick in
+    flight vs Brian2's ~17 ms, 170 MB vs 2.5 GB; the cut circuit is cached
+    (`circuit.escape_circuit`, `flybrain/cache/`, built by setup_brain.sh).
+    `--engine brian2` is the reference; `--hops 4` now fits (~30 ms). Non-blocking both
     ways: the flight uses the newest reply, the server skips to the newest step.
   - `FlyBrainPolicy`: signal = max giant-fiber rate / 100 Hz; left eye drive x
     1.35 (EYE_GAIN: the connectome's left pathway is less sensitive); side =
@@ -173,8 +178,9 @@ rule. A negative result is an acceptable result.
   maneuver re-triggers in clutter), `flybrain`.
 - Decision timing (Python): the geometric rule alone ~3.6 us replayed; with the
   eye's object tracking ~0.57 ms; camera network ~0.2 ms per look; live ~1.5 ms
-  (geometric) and ~1.6 ms (fly brain, without the brain's own 5-30 ms in its
-  process), against a 50 ms per-tick budget.
+  (geometric) and ~1.6 ms (fly brain, plus the brain's own ~2 ms in its
+  process), against a 50 ms per-tick budget. A fly-brain flight's CPU (one
+  desktop core = 100%): sim ~66%, simulated firmware ~50%, brain ~4%, flight ~5%.
 
 Two local patches to CrazySim: a firmware bug where a 32-bit variable was used
 for 64-bit timer ticks (froze the simulated firmware), and a sim patch: real

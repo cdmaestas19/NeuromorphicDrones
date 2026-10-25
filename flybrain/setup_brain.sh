@@ -37,4 +37,14 @@ echo "== Brain Python environment -> $SNN_VENV_DIR"
 import brian2, numpy
 print(f'   brian2 {brian2.__version__}, numpy {numpy.__version__}')
 EOF
+echo "== The flight's brain: the C engine (fastlif.c) and the cut escape circuit (cache/, ~1 min the first time)"
+(cd "$HERE" && "$SNN_VENV_DIR/bin/python" - <<'EOF'
+import fastlif
+from brain_server import FLIGHT_HOPS
+from circuit import MIN_SYNAPSES, escape_circuit
+fastlif.build()
+c = escape_circuit('783', FLIGHT_HOPS, MIN_SYNAPSES)
+print(f'   {len(c["ids"])} neurons, {len(c["pre"])} connections')
+EOF
+)
 echo "Brain setup complete. Check it with: flypilot\\brain_reproduce.cmd (see flybrain/README.md)"

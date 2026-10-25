@@ -74,11 +74,28 @@ is larger.
 | Circuit (FlyWire 783) | Neurons | Giant-fiber rates matched (of 8) | Speed |
 |---|---|---|---|
 | 2 synapses deep, connections >= 5 synapses | 566 | no: misses inhibition; the opposite side's giant fiber fires up to 2.5x too much | |
-| **3 deep, >= 5 (flown)** | **3,118** | close; one opposite-side rate off | **~11 ms per 50 ms tick; ~5 ms at the flight's 0.2 ms step** |
+| **3 deep, >= 5 (flown)** | **3,118** | close; one opposite-side rate off | **Brian2: ~5 ms per 50 ms tick idle, 17 ms on average in flight. C engine: 1.6-4 ms, 2.0 ms on average in flight** |
 | 4 deep, >= 10 | 4,854 | close; one opposite-side rate off | |
-| 4 deep, >= 5 | 18,326 | all 8 | 0.44 s per simulated second alone; 33-69 ms per 50 ms tick next to the simulator, too slow to fly |
+| 4 deep, >= 5 | 18,326 | all 8 | Brian2: 33-69 ms per tick next to the simulator, too slow to fly. C engine: 9 ms quiet, ~30 ms with looming |
 
-The drone flies the 3-deep circuit, the largest one that keeps up with real time next to the simulator.
+The drone flies the 3-deep circuit. It was the largest one that kept up with real time next to the
+simulator in Brian2, and its giant fibers respond to looming practically as the fully validated 4-deep
+circuit's do (table below), so the cut costs little where it matters. With the C engine the 4-deep
+circuit fits in the 50 ms tick too (`brain_server.py --hops 4`), with less room to spare on a laptop.
+
+**The C engine** (`fastlif.c`, the flight's default; `brain_server.py --engine brian2` runs Brian2).
+Brian2 steps the network from Python, and at 250 steps per 50 ms tick its per-step overhead, not the
+arithmetic, is most of the cost. `fastlif.c` is the same model in ~60 lines of C: the same equations
+(solved exactly per step), parameters (read from the model repo's `model.py`), order of events within a
+step, and the same rule that input reaching a refractory neuron is dropped (Brian2 adds that guard
+itself; without it the network spiked ~5% more). `check_fast.py` checks it: given the same input
+spikes for 1 s, every one of the 3,118 neurons spikes exactly as often as in Brian2 (18,170 spikes in
+both), and the giant fibers' looming response agrees at every drive level. In flight the brain's
+compute fell from 17 ms to 2 ms per tick, its CPU from 40% to 4% of a core, and its memory from 2.5 GB
+to 170 MB: the server loads the cut circuit from `cache/` instead of the whole connectome
+(`circuit.escape_circuit`; setup builds it). The kernel needs ~4 MB of arrays, and a few million simple
+operations per tick: within reach of the drone's own AI-deck (GAP8: 8 MB of RAM, 8 cores, fixed-point
+arithmetic), which would be a port, not a recompile.
 Its giant-fiber response to looming is practically the same as the fully validated 4-deep circuit's
 (table below), so the cut costs little where it matters.
 
@@ -210,8 +227,9 @@ closest the drone came to the person or the cart (drone edge to mover edge, heig
 - **Who chose the side** of the fly brain's 55 avoidance episodes: the eye's collision geometry 33
   times, the brain's steering neurons 10, the planner's map 9, the drone's own motion (a tie) 3. The
   giant fibers decided *when* in every episode.
-- **The brain's cost:** 18 ms per 50 ms tick on average, over 22,882 ticks. It answered more than a
-  tick late about 30 times per flight (the PC was in use).
+- **The brain's cost:** 18 ms per 50 ms tick on average, over 22,882 ticks, in Brian2 (the C engine
+  came after this comparison: ~2 ms). It answered more than a tick late about 30 times per flight (the
+  PC was in use).
 
 Read this with care:
 
@@ -246,12 +264,12 @@ Read this with care:
 - **Fairness of the comparison.** The other arms (CNN, shuffled connectome, abstract looming model,
   geometric rule) should get the same 360-degree eye. The geometric policy still uses the four range
   sensors.
-- **Speed.** The 3-deep circuit takes ~5 ms per 50 ms tick (0.2 ms steps) on one free core of a
-  desktop CPU. With a game or other heavy programs running it can take several times that, and the
-  brain then answers a tick or more late (the end-of-flight summary counts those ticks); late answers
-  were behind most remaining contacts in testing, so close heavy programs for fly-brain runs. The 4-deep circuit
-  that matches the whole brain on every giant-fiber rate is too slow to fly with in Brian2 here;
-  Brian2's standalone C++ mode, GeNN (GPU), or neuromorphic hardware would be the routes.
+- **Speed.** With the C engine the brain takes ~2 ms per 50 ms tick in flight (Brian2 took 17 ms on
+  average, and more on a busy PC, when it answered late: the end-of-flight summary counts late ticks).
+  The results above were flown with Brian2, before the C engine. The 4-deep circuit, which matches the
+  whole brain on every giant-fiber rate, now fits the tick too (~30 ms with looming on this PC).
+  Running on the drone itself would mean porting `fastlif.c` to the AI-deck (fixed point); neuromorphic
+  hardware is the other route.
 - **The connectome is a female brain (FlyWire).** Driving it with the drone's looming is an
   analogy: the drone is not a fly, and the descending neurons' targets (legs, wings) are replaced by
   velocity commands.
@@ -278,10 +296,13 @@ That is what makes it crash with "out of resources".
 | File | Purpose |
 |---|---|
 | `connectome.py` | the FlyWire connectome and its cell-type labels: pick neurons by name (`LC4`, `DNp01`) |
-| `circuit.py` | `extract()` cuts the escape circuit out of the whole brain; `Subcircuit` runs it with the model's own equations |
+| `circuit.py` | `extract()` cuts the escape circuit out of the whole brain; `escape_circuit()` caches it; `Subcircuit` runs it in Brian2 with the model's own equations |
 | `reproduce.py` (`flypilot\brain_reproduce.cmd`) | check 1: the model against the paper's result, and looming -> giant fiber in the whole brain |
 | `validate.py` (`flypilot\brain_validate.cmd`) | check 2: the cut-out circuit against the whole brain, and its speed |
-| `brain_server.py` | the brain for the drone: the circuit in one long Brian2 run, trading looming for spike counts every 50 ms over UDP 5320 |
+| `brain_server.py` | the brain for the drone: the circuit, trading looming for spike counts every 50 ms over UDP 5320 (`--engine fast`, the default, or `brian2`) |
+| `fastlif.c`, `fastlif.py` | the C engine: the same network ~10x cheaper in flight; built with gcc by setup (`build/`, not in git) |
+| `check_fast.py` | the C engine against Brian2: spike for spike on the same input, the giant fibers' looming response, compute per tick |
+| `cache/` | the cut circuit (`circuit.escape_circuit`), so the server doesn't load the whole connectome (not in git) |
 | `setup_brain.sh`, `requirements.txt`, `py.sh` | setup (run by `flypilot/setup.sh`) and the brain's own Python environment |
 | `results/` | whole-brain results of `brain_reproduce.cmd` (not in git) |
 | `../flypilot/eye.py` | the compound eye and looming |

@@ -24,12 +24,16 @@ commands below assume your terminal is in the repo folder.
   - About 3 GB of free disk space inside WSL: the sim and firmware build (~0.8 GB), the flight's
     Python (~0.55 GB), the fly brain's Python, model and connectome data (~1 GB). Training the
     camera network yourself (optional, run.txt test 10) adds ~1 GB.
-  - 2 CPU cores are enough for the sim and the geometric policy. The fly brain runs in a process
-    of its own and needs most of one more core (~5 ms per 50 ms tick on a free core; with a game
-    running it can take 30-40 ms, and its reactions get later), so 4 cores for fly-brain flights.
-  - Memory: 8 GB is plenty for flying. Only the brain checks that simulate the whole fly brain
-    (brain_reproduce.cmd, brain_validate.cmd) need more: 3-4.3 GB per simulation, run as many
-    at once as memory allows.
+  - 2 CPU cores are enough. Where a fly-brain flight's CPU goes (measured, in % of one desktop
+    core): the simulator's physics, eye and camera ~66%, the simulated Crazyflie firmware ~50%,
+    the fly brain ~4% (its C engine, ~2 ms per 50 ms tick), the flight and policy ~5%. The first
+    two exist only in simulation: on a real flight the Crazyflie runs its own firmware and there
+    is no physics to simulate. The 3D window adds GPU work on top (--headless opens none).
+  - Memory: 8 GB is plenty for flying (the fly brain uses ~170 MB). Only the brain checks that
+    simulate the whole fly brain (brain_reproduce.cmd, brain_validate.cmd) need more: 3-4.3 GB per
+    simulation, run as many at once as memory allows. The very first fly-brain start after setup
+    can take ~2.5 GB for a minute (it cuts its circuit out of the whole connectome once; setup
+    normally does this already).
 
   What we measured on one PC (RTX 4080, 20 cores), emulating weaker machines:
     GPU, 20 cores ........... sim at real time, camera 20 fps, waypoint flight OK
@@ -405,8 +409,20 @@ commands below assume your terminal is in the repo folder.
      flypilot\logs\sim.log should list "compound eye: 1800 ommatidia".
 
   The fly brain reacts late; its summary says "answers later than one tick: (many) tick(s)"
-     The brain needs about 12 ms of one CPU core per 50 ms tick. Games and other heavy programs
-     running at the same time slow it down to 40-45 ms; close them for fly-brain runs.
+     The brain needs ~2 ms of one CPU core per 50 ms tick (its C engine). If its summary shows
+     much more ("brain compute ... ms per 50 ms tick"), check logs\brain.log says "fast engine";
+     after a git pull, re-run flypilot\setup.cmd, which builds it.
+
+  Everything runs slowly on a laptop (RTF below 0.97 at the bottom left of the 3D window, or
+  flights drifting, or "stabilizer loop rate is off" in logs\sim.log)
+     - The simulator has to keep up with real time; the firmware runs on the real clock. Plug the
+       laptop in (on battery, Windows slows the CPU and GPU down) and pick the "Best performance"
+       power mode.
+     - Close other heavy programs (games, browsers with many tabs, video calls).
+     - Use --headless when you don't need to watch: no 3D window to draw.
+     - WSL gets half the laptop's memory by default; 8 GB of RAM in the laptop is the minimum.
+     - The flight's own end-of-run lines tell you where the time went: "decision cost" (the
+       policy, should be ~1-2 ms) and "brain compute" (should be ~2 ms).
 
   "not flying: no simulator answering" or "could not connect"
      The sim isn't running or didn't finish starting. Use launch.cmd, which waits for it. Or run

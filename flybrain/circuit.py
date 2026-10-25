@@ -9,8 +9,15 @@ most `hops` synaptic steps from an input neuron to an output neuron, through con
 
 Subcircuit runs it with the whole-brain model's own equations and parameters (model.py of the model repo,
 not a copy), with Poisson input whose rate can change between run() calls (the drone's camera drives it).
-validate.py checks it against the whole brain.
+validate.py checks it against the whole brain. fastlif.FastCircuit runs the same network in C (the flight's
+default: brain_server.py); check_fast.py checks the two against each other.
+
+escape_circuit() keeps the cut circuit in cache/ (a few MB): cutting it needs the whole connectome in
+memory (~2.5 GB, which a Python process doesn't give back), so only the first start does that.
 """
+import os
+from pathlib import Path
+
 import numpy as np
 import scipy.sparse as sp
 from brian2 import Hz, Network, NeuronGroup, PoissonGroup, SpikeMonitor, Synapses, defaultclock, ms, mV
@@ -66,40 +73,88 @@ def extract(conn: Connectome, hops: int = HOPS, min_synapses: int = MIN_SYNAPSES
     return ins, outs, ids
 
 
+def connections(conn: Connectome, ids: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The connections among `ids`: (pre, post, signed synapse count), pre / post as positions in `ids`."""
+    con = conn.connectivity
+    glob = np.array([conn.index[f] for f in ids])
+    inside = np.zeros(len(conn.ids), np.int64) - 1
+    inside[glob] = np.arange(len(glob))
+    pre, post = inside[con.Presynaptic_Index.to_numpy()], inside[con.Postsynaptic_Index.to_numpy()]
+    keep = (pre >= 0) & (post >= 0)
+    return pre[keep], post[keep], con['Excitatory x Connectivity'].to_numpy()[keep]
+
+
+CACHE_DIR = Path(__file__).resolve().parent / 'cache'
+CUT_VERSION = 1  # bump when extract() or what the cache holds changes
+
+
+def escape_circuit(version: str = '783', hops: int = HOPS, min_synapses: int = MIN_SYNAPSES) -> dict:
+    """The cut circuit as arrays, from cache/ (built from the connectome the first time, ~2.5 GB of memory):
+    ids (FlyWire), inputs (positions in ids, the looming detectors), input_left (bool per input), pre, post,
+    count (signed synapse counts), gf (positions of the left and right giant fibers), dn_names, dn_pos (the
+    other output descending neurons)."""
+    from connectome import BRAIN_MODEL_DIR, VERSIONS
+    source = BRAIN_MODEL_DIR / VERSIONS[version][1]
+    stamp = f'{CUT_VERSION}:{source.stat().st_size}:{int(source.stat().st_mtime)}'
+    path = CACHE_DIR / f'escape_{version}_h{hops}_s{min_synapses}.npz'
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as d:
+            if str(d['stamp']) == stamp:
+                return {k: d[k] for k in d.files}
+    conn = Connectome(version)
+    ins, outs, ids = extract(conn, hops, min_synapses)
+    pos = {f: i for i, f in enumerate(ids)}
+    pre, post, count = connections(conn, ids)
+    dn = [(conn.name(f), pos[f]) for f in outs if not conn.name(f).startswith(GIANT_FIBER)]
+    out = {'ids': np.array(ids, np.int64), 'inputs': np.array([pos[f] for f in ins], np.int64),
+           'input_left': np.array([conn.labels.side.get(f) == 'left' for f in ins]),
+           'pre': pre.astype(np.int32), 'post': post.astype(np.int32), 'count': count.astype(np.int32),
+           'gf': np.array([pos[conn.cells(GIANT_FIBER, s)[0]] for s in ('left', 'right')], np.int64),
+           'dn_names': np.array([n for n, _ in dn]), 'dn_pos': np.array([i for _, i in dn], np.int64),
+           'stamp': np.array(stamp)}
+    CACHE_DIR.mkdir(exist_ok=True)
+    tmp = path.with_suffix(f'.{os.getpid()}.tmp.npz')
+    np.savez_compressed(tmp, **out)
+    os.replace(tmp, path)
+    return out
+
+
 class Subcircuit:
     """A Brian2 network of just these neurons and every connection among them, with the whole-brain model's
     equations and parameters. Input neurons get Poisson input (as model.poi does: one input per neuron, a
     w_syn x f_poi kick to v, no refractory period) at rates set_rates() can change between run() calls."""
 
-    def __init__(self, conn: Connectome, ids: list, inputs: list, record: list, params: dict | None = None,
-                 dt_ms: float = 0.1):
+    def __init__(self, conn: Connectome | None, ids: list, inputs: list, record: list, params: dict | None = None,
+                 dt_ms: float = 0.1, arrays: tuple | None = None, input_source=None):
         """dt_ms: the integration step. 0.1 ms is the model's (Brian2's default); its equations are linear and
-        integrated exactly, so a coarser step mostly coarsens spike timing (brain_server.py measures it)."""
+        integrated exactly, so a coarser step mostly coarsens spike timing (brain_server.py measures it).
+        ids, inputs and record are FlyWire ids, or with arrays = (pre, post, count) (escape_circuit()'s, no
+        connectome needed) positions in the network. input_source: a Brian2 group to drive the inputs instead
+        of the Poisson group (check_fast.py: given spikes)."""
         p = dict(model.default_params if params is None else params)
         self.ids, self.inputs, self.record = list(ids), list(inputs), list(record)
-        local = {f: i for i, f in enumerate(self.ids)}
-        glob = np.array([conn.index[f] for f in self.ids])
-        con = conn.connectivity
-        inside = np.zeros(len(conn.ids), np.int64) - 1
-        inside[glob] = np.arange(len(glob))
-        e = con[(inside[con.Presynaptic_Index.to_numpy()] >= 0) & (inside[con.Postsynaptic_Index.to_numpy()] >= 0)]
-        self.n_connections = len(e)
+        if arrays is None:
+            local = {f: i for i, f in enumerate(self.ids)}
+            pre, post, count = connections(conn, self.ids)
+            idx_in, self._rec = np.array([local[f] for f in self.inputs]), np.array([local[f] for f in self.record])
+        else:
+            pre, post, count = arrays
+            idx_in, self._rec = np.asarray(self.inputs), np.asarray(self.record)
+        self.n_connections = len(pre)
 
         defaultclock.dt = dt_ms * ms
         self.neu = NeuronGroup(len(self.ids), model=p['eqs'], method='linear', threshold=p['eq_th'],
                                reset=p['eq_rst'], refractory='rfc', namespace=p)
         self.neu.v, self.neu.g, self.neu.rfc = p['v_0'], 0 * mV, p['t_rfc']
         self.syn = Synapses(self.neu, self.neu, 'w : volt', on_pre='g += w', delay=p['t_dly'])
-        self.syn.connect(i=inside[e.Presynaptic_Index.to_numpy()], j=inside[e.Postsynaptic_Index.to_numpy()])
-        self.syn.w = e['Excitatory x Connectivity'].to_numpy() * p['w_syn']
+        self.syn.connect(i=np.asarray(pre), j=np.asarray(post))
+        self.syn.w = np.asarray(count) * p['w_syn']
 
-        idx_in = np.array([local[f] for f in self.inputs])
         self.neu.rfc[idx_in] = 0 * ms  # as model.poi: no refractory period for Poisson targets
-        self.poisson = PoissonGroup(len(self.inputs), rates=0 * Hz)
+        self.poisson = input_source if input_source is not None else PoissonGroup(len(idx_in), rates=0 * Hz)
         self.kick = Synapses(self.poisson, self.neu, on_pre=f'v += {float(p["w_syn"] * p["f_poi"] / mV)}*mV')
-        self.kick.connect(i=np.arange(len(self.inputs)), j=idx_in)
+        self.kick.connect(i=np.arange(len(idx_in)), j=idx_in)
 
-        self._rec = np.array([local[f] for f in self.record])
         self.mon = SpikeMonitor(self.neu, record=False)  # per-neuron counts only: no memory growth in flight
         self.net = Network(self.neu, self.syn, self.poisson, self.kick, self.mon)
         self._last = np.zeros(len(self.ids), np.int64)

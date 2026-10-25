@@ -495,7 +495,8 @@ The end target is a small drone, so each decision is timed. Measured on this PC,
 | geometric policy as it flies now: the rule plus the eye's object tracking (what a threat is) | ~0.57 ms replayed |
 | the camera network, per look at a threat (numpy) | ~0.2 ms |
 | during a live flight, geometric (printed at the end of each `avoid` run, and on the dashboard) | ~1.5 ms mean |
-| during a live flight, fly brain (eye, camera, the round trip to the brain; not the brain's own ~5-30 ms, in its own process) | ~1.6 ms mean |
+| during a live flight, fly brain (eye, camera, the round trip to the brain) | ~1.6 ms mean |
+| the fly brain itself, per 50 ms tick, in its own process (C engine; Brian2 took ~17 ms) | ~2 ms mean |
 | budget: one 20 Hz control tick | 50 000 us |
 
 By operation count, the geometric rule plus the supervisor is under 10 divisions and ~200 simple
