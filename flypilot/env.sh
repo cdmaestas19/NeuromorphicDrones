@@ -20,4 +20,7 @@ VISION_VENV_DIR="${VISION_VENV_DIR:-$HOME/.venvs/flybrain-vision}"
 # (and the firmware with it). Route OpenGL to the Windows GPU through Mesa's D3D12 driver instead.
 if [ -e /usr/lib/wsl/lib/libd3d12.so ]; then
     export GALLIUM_DRIVER="${GALLIUM_DRIVER:-d3d12}"
+    # On laptops with two GPUs Mesa picks the integrated one; prefer an NVIDIA GPU when there is one
+    # (falls back to Mesa's choice when no adapter's name matches).
+    export MESA_D3D12_DEFAULT_ADAPTER_NAME="${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}"
 fi
