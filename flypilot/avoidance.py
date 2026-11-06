@@ -39,17 +39,24 @@ class Sensors(NamedTuple):
     mode: 'Mode'                  # supervisor mode on the previous tick, so a policy can run a maneuver
     eye: tuple | None = None      # the 360-degree compound eye's newest reading (eye.py): (sim time, position,
                                   # distances[elevation, azimuth], world-aligned); None without one
-    route_stop_m: float = math.inf  # how far ahead the route will bring the drone to a stop (its next stop, or
-                                    # 0 while holding); inf when it flies on. An efference copy of the plan
+    route_stop_m: float = math.inf  # how far the route takes the drone on straight ahead: to its next stop or to a
+                                    # turn (0 while holding); inf when it flies on. An efference copy of the plan
     route_cost: Callable[[float, float, float, float], float] | None = None
     # route_cost(x0, y0, x1, y1): how long the way to the current stop is if the drone first escapes straight
     # from (x0, y0) to (x1, y1), on the planner's map (planner.Planner.route_cost; inf: that escape runs into
     # something mapped). None without a map for this leg (bench.py replays, or just after the map grew)
+    on_map: Callable[[float, float], bool] | None = None
+    # on_map(x, y): whether that point is taken on the planner's map (an obstacle or its clearance, the
+    # geofence, or what the avoidance met); None without a map
+    mapped: Callable | None = None
+    # mapped([(x, y, z)]) -> bools: which of these points lie on the scene's mapped obstacles (exact, at that
+    # height; planner.Planner.mapped_at, seen=False): things known to stand still. None without a map
 
 
 def make_sensors(t: float, position: Vec3, yaw_deg: float, velocity_world: Vec3, intended_velocity_world: Vec3,
                  ranges: dict, mode: Mode, eye: tuple | None = None, route_stop_m: float = math.inf,
-                 route_cost: Callable | None = None) -> Sensors:
+                 route_cost: Callable | None = None, on_map: Callable | None = None,
+                 mapped: Callable | None = None) -> Sensors:
     """Build one tick's Sensors, rotating the world-frame velocities into the body frame.
     Shared by the flight (avoid_demo.py) and the offline replay (bench.py), so both time the same code."""
     yaw = yaw_deg * (math.pi / 180.0)
@@ -57,7 +64,8 @@ def make_sensors(t: float, position: Vec3, yaw_deg: float, velocity_world: Vec3,
     vx, vy, vz = velocity_world
     ix, iy, iz = intended_velocity_world
     return Sensors(t, position, yaw_deg, velocity_world, (vx * c + vy * s, vy * c - vx * s, vz),
-                   (ix * c + iy * s, iy * c - ix * s, iz), ranges, mode, eye, route_stop_m, route_cost)
+                   (ix * c + iy * s, iy * c - ix * s, iz), ranges, mode, eye, route_stop_m, route_cost, on_map,
+                   mapped)
 
 
 class AvoidCommand(NamedTuple):

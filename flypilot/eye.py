@@ -106,20 +106,33 @@ BELOW_DEG = -60.0  # rows at least this steep look at what is under the drone...
 BELOW_RADIUS_M = 0.6  # ...where they hit within this of it, horizontally. Further out is beside it, not under it:
                       # 0.9 m from an 8 m wall, the steep rays met the wall 1.6 m below the drone, and it never
                       # came down from cruise height
+UNDER_M = 0.2  # what the map has counts only this close (horizontally): right under the drone, not beside it
 
 
-def clear_below(reading) -> float:
+def clear_below(reading, known=None) -> float:
     """How far the drone could descend before reaching what is under it (m): the shortest vertical drop
     the steepest rows see within BELOW_RADIUS_M of it (the floor, or the top of a person or a cart). inf
-    if the eye has no such rows or sees nothing within range there (high up, the floor is out of range)."""
-    d = reading[2]
+    if the eye has no such rows or sees nothing within range there (high up, the floor is out of range).
+    known([(x, y, z)]) -> bools: hits on what the map has (the planned path keeps its distance from it),
+    which count only within UNDER_M. Without it, a crate 0.54 m beside the landing spot held the landing
+    for 30 s, and in a room of crates and partitions an escape's climb to 2 m was never undone."""
+    _, pos, d = reading
     el = elevations(d.shape[0])
     steep = el <= BELOW_DEG
     if not steep.any():
         return math.inf
-    rows = d[steep].astype(np.float32)
+    rows = np.asarray(d[steep], dtype=np.float32)
     a = np.radians(-el[steep])[:, None]
-    hit = (rows > SELF_M) & (rows < MAX_RANGE_M) & (rows * np.cos(a) <= BELOW_RADIUS_M)
+    flat = rows * np.cos(a)
+    hit = (rows > SELF_M) & (rows < MAX_RANGE_M) & (flat <= BELOW_RADIUS_M)
+    if known is not None and hit.any():
+        r, c = np.nonzero(hit)
+        az = np.radians(c * (360.0 / d.shape[1]))
+        aside = flat[r, c] > UNDER_M
+        pts = np.column_stack([pos[0] + flat[r, c] * np.cos(az), pos[1] + flat[r, c] * np.sin(az),
+                               pos[2] - rows[r, c] * np.sin(a[r, 0])])
+        if aside.any():
+            hit[r[aside], c[aside]] = ~np.asarray(known(pts[aside]), bool)
     drop = np.where(hit, rows * np.sin(a), np.inf)
     return float(drop.min())
 
@@ -149,6 +162,71 @@ def ring(reading, yaw_deg: float) -> tuple:
     near = np.where((rows > SELF_M) & (rows < MAX_RANGE_M), rows, np.inf).min(axis=0)
     az = (np.arange(n_az) * (360.0 / n_az) - yaw_deg + 180.0) % 360.0 - 180.0
     return az, near
+
+
+ROUND_MAX_M = 1.6       # footprint(): a circle bigger than this fits a flat face, not a round thing
+ROUND_FIT_M = 0.04      # ...and the points must lie this close to it (RMS)
+ROUND_SEEN = 0.7        # ...and span this much of the front a circle that size shows: four points of a crate's
+                        # face, one round its corner, fitted a 0.43 m disc whose clearance took in a stop
+DEPTH_M = (0.3, 0.6)    # a flat face is taken to go back as deep as it is wide, within these
+CORNER_M = 0.08         # points further than this from the line between their two ends: two faces (a corner)
+CORNER_MAX_M = 2.0      # ...of a box no wider than this (wider: two things, a wall and a cart's side)
+BULGE = (0.04, 0.12)    # a round thing bulges toward the eye by at least this (m, and x its width): five points of
+                        # a crate's flat face fitted a 1 m circle just as well
+ROUND_MIDDLE = 0.2      # ...measured within this (x its width) of the middle: a crate's face and one point round
+                        # its corner bulge most at that end, and fitted a 0.35 m disc that took in a stop
+FILL_M = 0.1            # the footprint's points are this far apart
+
+
+def footprint(points: np.ndarray, viewpoint) -> np.ndarray:
+    """All of an object, from the part of it the eye sees: its points on the ring (CollisionCourse's,
+    world x, y), seen from `viewpoint`. The eye sees only the near side, and a path planned round that
+    alone runs into the far side: the drone dodged a 2.4 m tree crown ten times, each time mapping a bit
+    more of it. A round thing (a tree's crown, a pole, a person standing) fits a circle, whose centre lies
+    beyond its face: the whole disc. Two faces of a box (seen from a corner) are mirrored across the line
+    between their ends: the far corner. One flat face is taken to go straight back from it (along its
+    normal, away from the viewpoint) as deep as it is wide (DEPTH_M). (Pushing points back along the
+    view rays overshot the far side: a face seen at a slant was pushed diagonally past the crate's far
+    edge, and with the clearance round it a stop 0.45 m behind the crate became unreachable.) Returns
+    points filling it, FILL_M apart, [(x, y)]."""
+    p = np.asarray(points, float)
+    if len(p) < 3:
+        return p
+    v = np.asarray(viewpoint[:2], float)
+    gap = np.hypot(p[:, None, 0] - p[None, :, 0], p[:, None, 1] - p[None, :, 1])
+    i, j = np.unravel_index(int(np.argmax(gap)), gap.shape)
+    chord = p[j] - p[i]
+    width = float(np.hypot(*chord))
+    if width == 0.0:
+        return p
+    normal = np.array([-chord[1], chord[0]]) / width
+    off = (p - p[i]) @ normal  # each point's distance from the line between the two ends
+    bulge = float(np.abs(off).max())
+    middle = np.abs((p - p[i]) @ chord / (width * width) - 0.5) <= ROUND_MIDDLE  # an arc bulges most mid-chord
+    arc = float(np.abs(off[middle]).max()) if middle.any() else 0.0
+    a = np.column_stack([p[:, 0], p[:, 1], np.ones(len(p))])
+    (k1, k2, k3), *_ = np.linalg.lstsq(a, -(p ** 2).sum(axis=1), rcond=None)  # x^2 + y^2 + k1 x + k2 y + k3 = 0
+    c = np.array([-k1 / 2.0, -k2 / 2.0])
+    r2 = c @ c - k3
+    if 0.0 < r2 <= ROUND_MAX_M ** 2 and arc >= max(BULGE[0], BULGE[1] * width):
+        r = float(np.sqrt(r2))
+        fit = float(np.sqrt(np.mean((np.hypot(*(p - c).T) - r) ** 2)))
+        dist = float(np.hypot(*(c - v)))
+        shown = 2.0 * r * math.sqrt(max(1.0 - (r / dist) ** 2, 0.0))  # its front, tangent point to tangent point
+        if fit <= ROUND_FIT_M and dist > np.hypot(*(p.mean(axis=0) - v)) and width >= ROUND_SEEN * shown:
+            g = np.arange(-r, r + 1e-9, FILL_M)
+            gx, gy = np.meshgrid(g, g)
+            inside = gx ** 2 + gy ** 2 <= r * r
+            rim = np.linspace(0.0, 2.0 * np.pi, max(int(2.0 * np.pi * r / FILL_M), 8), endpoint=False)
+            return np.vstack([np.column_stack([c[0] + gx[inside], c[1] + gy[inside]]),
+                              np.column_stack([c[0] + r * np.cos(rim), c[1] + r * np.sin(rim)])])
+    if CORNER_M < bulge and width <= CORNER_MAX_M:  # two faces: the far corner is the near one mirrored
+        mirrored = p - 2.0 * off[:, None] * normal[None, :]
+        ends = np.linspace(0.0, 1.0, max(int(width / FILL_M), 2))[:, None]
+        return np.vstack([p, mirrored, p[i] + ends * chord])
+    away = normal if (p.mean(axis=0) - v) @ normal > 0.0 else -normal  # straight back from the face
+    steps = np.arange(0.0, min(max(width, DEPTH_M[0]), DEPTH_M[1]) + 1e-9, FILL_M)
+    return (p[:, None, :] + away[None, None, :] * steps[None, :, None]).reshape(-1, 2)
 
 
 CLEARANCE_HALF_DEG = 100.0  # the supervisor's resume clearance looks this far either side of the heading
@@ -203,13 +281,15 @@ class SeenObject(NamedTuple):
     kind: str = 'static'      # 'static' (never seen moving), 'person', 'vehicle' or 'unknown' (CollisionCourse)
     width: float = 0.0        # how wide it looks, m: the median spread of its points over the last readings
     still_s: float = math.inf  # how long since it was last seen moving (inf: never)
+    z: np.ndarray | None = None  # each point's height, m: the ring's rows look from 5 deg down to 15 deg up
 
 
 class _Track:
     def __init__(self):
         self.hist = deque(maxlen=36)  # (t, cx, cy): ~1.8 s (HEADING_S)
         self.moved = False
-        self.spreads = deque(maxlen=5)  # the largest distance between two of its points, per reading
+        self.spreads = deque(maxlen=12)  # the largest distance between two of its points, per reading: ~0.6 s,
+                                         # longer than CollisionCourse.WINDOW_S (EMERGE_M: its velocity's span)
         self.steady = 0                 # readings in a row it has moved fast, the same way
         self.last_v = None              # its velocity at the last of those
         self.last_moving_t = None       # when it was last seen moving (after it counted as moved)
@@ -257,6 +337,13 @@ class CollisionCourse:
                            # crates "walking" beside a drone that escaped at 0.8 m/s)
     MOVE_CONFIRM = 3       # readings in a row (0.15 s) of fast motion before an object counts as moved...
     MOVE_TURN_DEG = 45.0   # ...each within this of the one before
+    EMERGE_M = 0.5         # ...and, before it ever moved, while its width holds within this (+ EMERGE_FRAC of it).
+                           # Not less: a person 4 m off is one ray wide (0 m), 2 m off two or three (~0.3 m), and
+                           # at 0.25 m their setting off toward the drone went unnoticed (na_hover: contact)
+    EMERGE_FRAC = 0.25     # Something coming into view grows, dragging its centroid: a tree's crown (3.3-5.7 m up)
+                           # rising into view as the drone climbed to cruise height grew 0.5 -> 1.9 m wide, its
+                           # centroid "moving" at 2.8 m/s; it counted as a vehicle and never went on the map. A
+                           # person or a cart keeps its width as it moves
     MISS_FULL_M = 0.15     # the drone's 0.07 m radius plus margin
     MISS_ZERO_M = 0.3      # the planner's clearance: a planned pass beside a mapped obstacle never counts
     HORIZON_S = 4.0        # closest approaches further off than this don't count yet
@@ -269,16 +356,49 @@ class CollisionCourse:
                            # person merged with a bench (4.9-7.6 m). A real car seen corner-on reads ~5 m: then
                            # this needs the camera (it is the cue the eye can't give)
 
+    MOVERS_KEPT_S = 20.0   # near_movers(): where things were seen moving (their centroids), kept this long...
+    MOVER_NEAR_M = 0.5     # ...and an object with a point this close to one of those may be one of them, paused (a
+                           # cart's centroid passed right where it stands; a tree crown 0.6 m from a walkway's
+                           # middle, where people walk, still goes on the map)
+
     def __init__(self):
         self._tracks = []                 # [_Track]
         self._drone = deque(maxlen=12)    # (t, x, y)
         self.objects = []                 # the last reading's objects (SeenObject)
+        self._moved_at = deque()          # (t, x, y): centroids of objects seen moving
 
-    def update(self, reading, stop_after_m: float = math.inf) -> np.ndarray:
+    def near_movers(self, points: np.ndarray) -> bool:
+        """Whether an object (its points, world x, y) is where something was seen moving in the last
+        MOVERS_KEPT_S: a cart paused at the end of its run, re-found by the tracker as a new object, isn't
+        known to move yet, and mapping it put an obstacle in the road (nc_cart)."""
+        return bool(self.where_movers(points).any())
+
+    def where_movers(self, points: np.ndarray) -> np.ndarray:
+        """near_movers() per point: which of `points` (world x, y, ...) are within MOVER_NEAR_M of where
+        something was seen moving in the last MOVERS_KEPT_S."""
+        p = np.asarray(points, float)
+        if not self._moved_at or not len(p):
+            return np.zeros(len(p), bool)
+        m = np.array([(x, y) for _, x, y in self._moved_at])
+        return (np.hypot(m[:, None, 0] - p[None, :, 0], m[:, None, 1] - p[None, :, 1]) < self.MOVER_NEAR_M).any(axis=0)
+
+    def update(self, reading, stop_after_m: float = math.inf, mapped=None) -> np.ndarray:
         """stop_after_m: the drone will stop this far ahead (an efference copy of its route): something
-        standing still further along its path than that is no threat."""
+        standing still further along its path than that is no threat. mapped([(x, y, z)]) -> bools: points
+        on the scene's mapped obstacles (planner.mapped_at, seen=False). An object mostly on them stands
+        still: walls, a beam, a partition slid along with the passing (or climbing, descending) drone as
+        their visible stretch changed, counted as movers, and a drone that had come down beside a crate
+        dodged the room's east wall eleven times (fe1_blocked). Only the scene's: what the drone mapped
+        itself may be a person who stood still until then."""
         t, pos, _ = reading
+        while self._moved_at and t - self._moved_at[0][0] > self.MOVERS_KEPT_S:
+            self._moved_at.popleft()
         az, near = ring(reading, 0.0)
+        el = elevations(reading[2].shape[0])
+        band = (el >= RING_ELEVATION_DEG[0]) & (el <= RING_ELEVATION_DEG[1])
+        rows = reading[2][band]
+        rows = np.where((rows > SELF_M) & (rows < MAX_RANGE_M), rows, np.inf)
+        height = pos[2] + np.where(np.isfinite(near), near, 0.0) * np.sin(np.radians(el[band][rows.argmin(axis=0)]))
         n = len(near)
         a = np.radians(az)
         ux, uy = np.cos(a), np.sin(a)
@@ -301,7 +421,12 @@ class CollisionCourse:
             if speed > 0.0 and math.hypot(hx, hy) > 0.7 * speed and hx * vox + hy * voy > 0.0:
                 k = speed / math.hypot(hx, hy)  # the long window's direction, the short one's speed (not round a turn)
                 vox, voy = hx * k, hy * k
-            if speed < self.STATIC_MPS or self._parallax(vox, voy, vdx, vdy):
+            emerging = (not track.moved  # only before it ever moved: a person walking up grows too (more rays
+                        and max(track.spreads) - min(track.spreads) > self.EMERGE_M + self.EMERGE_FRAC * width)
+                                         # hit them), and ignoring their motion then let one reach a hovering
+                                         # drone's back unflagged (mv_headon, mw_headon)
+            on_map = mapped is not None and np.mean(mapped(np.column_stack([px, py, height[cols]]))) >= 0.5
+            if speed < self.STATIC_MPS or self._parallax(vox, voy, vdx, vdy) or emerging or on_map:
                 vox = voy = 0.0
                 track.steady, track.last_v = 0, None
             else:
@@ -315,6 +440,8 @@ class CollisionCourse:
                     track.last_moving_t = t
             kind = ('static' if not track.moved else 'person' if width < self.VEHICLE_M
                     else 'vehicle' if width <= self.VEHICLE_MAX_M else 'unknown')
+            if track.moved and (vox or voy):
+                self._moved_at.append((t, cx, cy))
             rvx, rvy = vox - vdx, voy - vdy  # the object's motion relative to the drone
             v2 = rvx * rvx + rvy * rvy
             w, miss_vec = 0.0, (0.0, 0.0)
@@ -339,7 +466,7 @@ class CollisionCourse:
             weight[cols] = w
             still = math.inf if track.last_moving_t is None else t - track.last_moving_t
             self.objects.append(SeenObject(cols, w, (vox, voy), track.moved, np.column_stack((px, py)), miss_vec,
-                                           kind, width, still))
+                                           kind, width, still, height[cols]))
         self._tracks = tracks
         return weight
 
@@ -421,11 +548,13 @@ class Looming:
         self.threat_miss = (0.0, 0.0)      # drone -> its centre where its path passes closest (world)
         self.threat_points = np.zeros((0, 2))  # where the eye's rays hit it, [(x, y)] world: how big it is
         self.threat_kind = ''                  # what it is: SeenObject.kind ('' when nothing looms)
+        self.loom_map = None     # looming per ommatidium (rows x world-frame columns), 1/s, as drive() sees it
+        self._map_yaw = 0.0
         self.objects = CollisionCourse() if collision_selective else None
 
-    def update(self, reading, yaw_deg: float, stop_after_m: float = math.inf):
+    def update(self, reading, yaw_deg: float, stop_after_m: float = math.inf, mapped=None):
         t, _, d = reading
-        weight = self.objects.update(reading, stop_after_m) if self.objects else None
+        weight = self.objects.update(reading, stop_after_m, mapped) if self.objects else None
         if self._prev is None or t <= self._prev[0]:
             self._prev = (t, d)
             return
@@ -439,9 +568,12 @@ class Looming:
         n_el = d.shape[0]
         rows = elevations(n_el) >= MIN_ELEVATION_DEG
         column = steady[rows].max(axis=0)  # per azimuth: the most looming elevation (floor rows left out)
+        self.loom_map = np.where(rows[:, None], steady, 0.0)
         if weight is not None:
             column = column * weight  # only what is on a collision course looms (LPLC2's selectivity)
+            self.loom_map = self.loom_map * weight[None, :]
             self._threat(column, yaw_deg)
+        self._map_yaw = yaw_deg
         n_az = len(column)
         rel = (np.arange(n_az) * (360.0 / n_az) - yaw_deg + 180.0) % 360.0 - 180.0  # + = left of the heading
         centers = np.arange(-180.0 + FIELD_DEG / 2, 180.0, FIELD_DEG)
@@ -457,6 +589,17 @@ class Looming:
 
     def drive(self) -> tuple:
         return self.left, self.right
+
+    def loom_points(self) -> np.ndarray:
+        """Every ommatidium that sees looming (loom_map): [(azimuth from the heading, + left; elevation;
+        looming 1/s)], degrees. The retinotopic input: the brain drives each of its looming detectors from
+        those inside its own receptive field (flybrain/retinotopy.py)."""
+        if self.loom_map is None:
+            return np.zeros((0, 3))
+        r, c = np.nonzero(self.loom_map)
+        n_el, n_az = self.loom_map.shape
+        az = (c * (360.0 / n_az) - self._map_yaw + 180.0) % 360.0 - 180.0
+        return np.column_stack([az, elevations(n_el)[r], self.loom_map[r, c]])
 
     PERSON_RECENT_S = 2.0  # nearest_person(): people seen moving this recently (people in our scenes walk on; a
                            # crate's centroid can still jump like a step now and then, and then stays still)

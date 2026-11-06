@@ -1,6 +1,6 @@
 """Does fastlif (the C engine the flight uses) run the same network as Brian2 (circuit.Subcircuit)?
 
-    bash py.sh check_fast.py [--hops 3] [--dt-ms 0.2] [--trials 6]
+    bash py.sh check_fast.py [--circuit active|h3|h4] [--dt-ms 0.2] [--trials 6]
 
 1. Spike for spike: both engines get the same input spikes (a random draw, given to Brian2 through a
    SpikeGeneratorGroup) for 1 s; every neuron's spike count must match. Only floating-point rounding can
@@ -16,8 +16,8 @@ import time
 import numpy as np
 from brian2 import Hz, SpikeGeneratorGroup, ms
 
-from brain_server import FLIGHT_DT_MS, FLIGHT_HOPS, MAX_RATE_HZ, TICK_MS
-from circuit import MIN_SYNAPSES, Subcircuit, escape_circuit
+from brain_server import FLIGHT_CIRCUIT, FLIGHT_DT_MS, MAX_RATE_HZ, TICK_MS
+from circuit import CIRCUITS, Subcircuit, flight_circuit
 from fastlif import FastCircuit, _steps
 
 
@@ -29,11 +29,11 @@ def brian(c: dict, dt_ms: float, source=None) -> Subcircuit:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--hops', type=int, default=FLIGHT_HOPS)
+    ap.add_argument('--circuit', choices=CIRCUITS, default=FLIGHT_CIRCUIT)
     ap.add_argument('--dt-ms', type=float, default=FLIGHT_DT_MS)
     ap.add_argument('--trials', type=int, default=6)
     args = ap.parse_args()
-    c = escape_circuit('783', args.hops, MIN_SYNAPSES)
+    c = flight_circuit(args.circuit)
     n, n_in, dt = len(c['ids']), len(c['inputs']), args.dt_ms
     print(f'circuit: {n} neurons, {len(c["pre"])} connections, {n_in} looming-detector inputs; step {dt:g} ms')
     ok = True

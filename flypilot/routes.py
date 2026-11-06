@@ -9,7 +9,8 @@ The moving-obstacle scenarios run in the "street" scene (scenes/street.xml), a 1
 walkway along y = 3 (2..4) and a road along x = 3 (1.5..4.5). People walk at 1.0 m/s, the cart drives at
 1.5 m/s. Their walks start when the drone reaches a trigger point, so the first encounter happens in the
 same place on every run; after that the people and the cart keep going back and forth along their paths,
-so later encounters (e.g. someone overtaking the drone from behind) differ from run to run.
+so later encounters (e.g. someone overtaking the drone from behind) differ from run to run. A route with
+home=False ends by landing at its last stop instead.
 """
 from typing import NamedTuple
 
@@ -30,6 +31,7 @@ class Route(NamedTuple):
     dwell_s: float = 1.0   # hover at each stop (the drop-off)
     cruise_m: float | None = None  # fly between stops this high, descending to ALTITUDE_M at each stop (a real
                                    # delivery drone cruises above people and cars); None: everything at ALTITUDE_M
+    home: bool = True              # after the last stop fly home and land there; False: land at the last stop
 
 
 ROUTES = {
@@ -87,6 +89,15 @@ ROUTES = {
                      'cruising at 4.5 m to a stop where the cart is parked (no map knows about a parked cart): the '
                      'drone has to see that the drop-off point is taken, wait above it, then come down beside it',
                      scene='street', cruise_m=DELIVERY_CRUISE_M),
+
+    # ---- the showcase: everything at once
+    'showcase': Route([(-5.2, -3.6), (-5.3, 5.2), (1.0, 3.6)], 'notrees',
+                      'a delivery round on a street map, which has no trees. Cruising at 4.5 m, the first leg runs '
+                      'into tree1\'s crown (3.3-5.7 m up, 2.4 m wide), the last into tree2\'s, where the north wall '
+                      'leaves no room on one side; then it lands at the edge of the walkway (0.6 m from the line a '
+                      'person walks on) while they walk past: it waits above, and the descent pauses as they pass',
+                      scene='street', cruise_m=DELIVERY_CRUISE_M, home=False,
+                      movers=(Walk('person1', [(4.5, 3.0), (-1.5, 3.0)], 1.0, start_near=((1.0, 3.6), 0.3)),)),
 }
 
 # How high live flights (launch.cmd deliver) cruise between stops; ALTITUDE_M where not listed (CrazySim's

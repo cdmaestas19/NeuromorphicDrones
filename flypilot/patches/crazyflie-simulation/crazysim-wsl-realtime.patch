@@ -1,8 +1,8 @@
 diff --git a/simulator_files/mujoco/crazysim.py b/simulator_files/mujoco/crazysim.py
-index d4a7eb9..1fc8f89 100644
+index d4a7eb9..56122dc 100644
 --- a/simulator_files/mujoco/crazysim.py
 +++ b/simulator_files/mujoco/crazysim.py
-@@ -56,6 +56,7 @@ Multi-agent usage:
+@@ -56,11 +56,16 @@ Multi-agent usage:
  """
  
  import argparse
@@ -10,19 +10,39 @@ index d4a7eb9..1fc8f89 100644
  import math
  import os
  import queue
-@@ -70,6 +71,11 @@ import mujoco
++import shutil
++import signal
+ import socket
+ import struct
++import subprocess
++import sys
+ import threading
+ import time
+ import xml.etree.ElementTree as ET
+@@ -70,6 +75,11 @@ import mujoco
  import mujoco.viewer
  import numpy as np
  
 +try:
-+    import cv2  # optional: smoother scaling of the viewer's side panel
++    import cv2  # optional: smoother scaling of the viewer's side panel; needed to record video
 +except ImportError:
 +    cv2 = None
 +
  # ---------------------------------------------------------------------------
  # CRTP constants (CrtpUtils.h)
  # ---------------------------------------------------------------------------
-@@ -112,6 +118,17 @@ TOF_RATE_HZ   = 40         # VL53L1x ToF update rate (flowdeck)
+@@ -97,6 +107,10 @@ DEG_TO_RAD          = math.pi / 180.0
+ #   CCW prop (motor0,2) → body receives -Z torque (reaction to CCW spin)
+ #   CW  prop (motor1,3) → body receives +Z torque (reaction to CW  spin)
+ MOTOR_DIR = np.array([-1.0, 1.0, -1.0, 1.0])
++# The propellers are turned for the picture only (they are massless visual bodies; thrust and torque come
++# from the motor model): at this fraction of their real speed, which is ~250 turns a second, too fast for
++# any screen or camera (at 30 or 60 frames a second it strobes: they look still or run backwards)
++PROP_VISUAL_SPEED = 1.0 / 40.0
+ 
+ # Standard atmosphere for baro simulation
+ T0_K     = 288.15
+@@ -112,6 +126,17 @@ TOF_RATE_HZ   = 40         # VL53L1x ToF update rate (flowdeck)
  FLOW_NPIX     = 30.0       # PMW3901 pixel count
  FLOW_THETAPIX = 4.2 * math.pi / 180.0  # FOV per pixel [rad]
  CFLIB_PORT_OFFSET = -100   # cflib port = firmware port + offset (19950 → 19850)
@@ -40,7 +60,7 @@ index d4a7eb9..1fc8f89 100644
  
  # ---------------------------------------------------------------------------
  # Per-model motor parameters — loaded from drone-models submodule params.toml
-@@ -414,6 +431,12 @@ class CameraRenderer:
+@@ -414,6 +439,12 @@ class CameraRenderer:
  
      Frames are split into numbered UDP chunks so they fit in datagrams.
      Chunk format: [seq:u16][total:u16][width:u16][height:u16][data]
@@ -53,7 +73,7 @@ index d4a7eb9..1fc8f89 100644
      """
  
      def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
-@@ -424,7 +447,8 @@ class CameraRenderer:
+@@ -424,7 +455,8 @@ class CameraRenderer:
                                            self._cam_name)
          if self._cam_id < 0:
              raise ValueError(f'Camera {self._cam_name!r} not found in model')
@@ -63,7 +83,7 @@ index d4a7eb9..1fc8f89 100644
          self._width = width
          self._height = height
          self._frame_period = 1.0 / fps
-@@ -436,16 +460,42 @@ class CameraRenderer:
+@@ -436,16 +468,42 @@ class CameraRenderer:
          print(f'[crazysim] Agent {agent_id}: camera frames → '
                f'udp://127.0.0.1:{self._port}')
  
@@ -110,7 +130,7 @@ index d4a7eb9..1fc8f89 100644
          img_bytes = gray.tobytes()
  
          # Split into UDP chunks
-@@ -460,9 +510,356 @@ class CameraRenderer:
+@@ -460,9 +518,724 @@ class CameraRenderer:
                  pass
  
      def stop(self):
@@ -217,6 +237,372 @@ index d4a7eb9..1fc8f89 100644
 +
 +
 +# ---------------------------------------------------------------------------
++# Chase view and video: the drone from behind and a little above, in the viewer and/or to a file
++# ---------------------------------------------------------------------------
++CHASE = os.environ.get('CRAZYSIM_CHASE', '0') == '1'   # the viewer follows agent 0
++VIDEO_PATH = os.environ.get('CRAZYSIM_VIDEO', '')      # record what the viewer shows to this file (.mp4)
++VIDEO_SIZE = (1280, 720)       # without a viewer window; with one, the window's size
++VIDEO_MAX_SIZE = (2560, 1440)  # a bigger window is recorded scaled down to fit
++VIDEO_FPS = 30.0
++VIDEO_CRF = 18                 # H.264 quality (lower is better; 18 looks like the picture itself)
++
++
++class ChaseCamera:
++    """The view from behind a drone and a little above it, turning with its heading, as a follow camera
++    films it. Its heading and position are smoothed (in simulated time), so the drone's own small
++    corrections don't shake the view and a turn swings it round in about a second."""
++
++    DISTANCE_M = 1.0        # a Crazyflie is 9 cm across: from 2.4 m it was a speck, and posts got in between
++    ELEVATION_DEG = -22.0   # looking down at the drone
++    AIM_ABOVE_M = 0.08      # aim this far above it: the drone sits a little below the middle of the picture
++    YAW_TAU_S = 0.5
++    POS_TAU_S = 0.1
++
++    def __init__(self, body_id: int):
++        self._body = body_id
++        self._t = None
++        self._yaw = 0.0
++        self._pos = np.zeros(3)
++
++    def view(self, data: mujoco.MjData) -> tuple:
++        """(lookat, azimuth deg) for the drone's state in `data`."""
++        pos = data.xpos[self._body]
++        w, x, y, z = data.xquat[self._body]
++        yaw = math.degrees(math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
++        if self._t is None or data.time < self._t:
++            self._yaw, self._pos[:] = yaw, pos
++        else:
++            dt = data.time - self._t
++            self._yaw += (1.0 - math.exp(-dt / self.YAW_TAU_S)) * ((yaw - self._yaw + 180.0) % 360.0 - 180.0)
++            self._pos += (1.0 - math.exp(-dt / self.POS_TAU_S)) * (pos - self._pos)
++        self._t = data.time
++        return self._pos + np.array([0.0, 0.0, self.AIM_ABOVE_M]), self._yaw
++
++    def apply(self, cam, data: mujoco.MjData):
++        """Point a viewer camera (mjvCamera) at the drone from behind."""
++        lookat, azimuth = self.view(data)
++        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
++        cam.lookat[:] = lookat
++        cam.azimuth, cam.elevation, cam.distance = azimuth, self.ELEVATION_DEG, self.DISTANCE_M
++
++
++class _FrameDrawer:
++    """Draws frames as the viewer window shows them, offscreen, with MuJoCo's own calls (mjr_render,
++    mjr_overlay, mjr_drawPixels, as the viewer does): the scene from a camera, the markers, the RTF and time
++    bottom-left, agent 0's FPV image top-left and the side panel on the right (ViewerOverlay's layout)."""
++
++    def __init__(self, model: mujoco.MjModel, w: int, h: int, scale: float = 1.0):
++        self.w, self.h, self.scale = w, h, scale
++        self.gl = mujoco.GLContext(w, h)  # the GL context lives on the thread that made it
++        self.gl.make_current()
++        self.scn = mujoco.MjvScene(model, maxgeom=10000)
++        self.con = mujoco.MjrContext(model, mujoco.mjtFontScale.mjFONTSCALE_150)
++        mujoco.mjr_setBuffer(mujoco.mjtFramebuffer.mjFB_OFFSCREEN, self.con)
++        self.cam, self.opt, self.pert = mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb()
++        self.rect = mujoco.MjrRect(0, 0, w, h)
++        self._rgb = np.empty((h, w, 3), np.uint8)
++
++    def draw(self, model: mujoco.MjModel, data: mujoco.MjData, cam: tuple, opt, markers: list, rtf: float,
++             fpv, panel) -> np.ndarray:
++        """The frame, RGB, top row first. cam: (type, lookat, azimuth, elevation, distance, trackbodyid,
++        fixedcamid); opt: the viewer's (flags, geomgroup, sitegroup, frame, label), or None for the defaults;
++        fpv: a grey image or None; panel: an RGB image or None."""
++        w, h, con = self.w, self.h, self.con
++        ctype, lookat, azimuth, elevation, distance, trackbody, fixedcam = cam
++        c = self.cam
++        c.type, c.trackbodyid, c.fixedcamid = ctype, trackbody, fixedcam
++        c.lookat[:] = lookat
++        c.azimuth, c.elevation, c.distance = azimuth, elevation, distance
++        if opt is not None:
++            self.opt.flags[:], self.opt.geomgroup[:], self.opt.sitegroup[:] = opt[0], opt[1], opt[2]
++            self.opt.frame, self.opt.label = opt[3], opt[4]
++        mujoco.mjv_updateScene(model, data, self.opt, self.pert, c, mujoco.mjtCatBit.mjCAT_ALL, self.scn)
++        for mk in markers:
++            if self.scn.ngeom >= self.scn.maxgeom:
++                break
++            try:
++                _marker_geom(self.scn.geoms[self.scn.ngeom], mk)
++            except (KeyError, TypeError, ValueError):
++                continue
++            self.scn.ngeom += 1
++        mujoco.mjr_render(self.rect, self.scn, con)
++        # The text first: mjr_overlay sets up 2-D drawing; images drawn straight after mjr_render came out
++        # wrong (the scene's fog and lighting still applied: white).
++        mujoco.mjr_overlay(mujoco.mjtFont.mjFONT_NORMAL, mujoco.mjtGridPos.mjGRID_BOTTOMLEFT, self.rect,
++                           f'RTF: {rtf:.2f}x', f't={data.time:.1f}s', con)
++        if fpv is not None:
++            if self.scale != 1.0:
++                fpv = cv2.resize(fpv, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
++            ih, iw = fpv.shape[:2]
++            m = max(1, int(round(10 * self.scale)))
++            if ih + 2 * m < h and iw + 2 * m < w:
++                img = np.ascontiguousarray(np.flip(np.repeat(fpv[:, :, None], 3, axis=2), 0))
++                mujoco.mjr_drawPixels(img.ravel(), None, mujoco.MjrRect(m, h - ih - m, iw, ih), con)
++        if panel is not None:
++            ph, pw = panel.shape[:2]
++            s = min(h / ph, OVERLAY_PANEL_MAX_WIDTH * w / pw)
++            size = (max(1, int(pw * s)), max(1, int(ph * s)))
++            fitted = panel if size == (pw, ph) else cv2.resize(panel, size, interpolation=cv2.INTER_AREA)
++            img = np.ascontiguousarray(np.flip(fitted, 0))
++            mujoco.mjr_drawPixels(img.ravel(), None, mujoco.MjrRect(w - size[0], 0, size[0], size[1]), con)
++        mujoco.mjr_readPixels(self._rgb, None, self.rect, con)
++        return np.flipud(self._rgb)
++
++    def free(self):
++        self.gl.free()
++
++
++def _ffmpeg_writer(path: str, w: int, h: int, crf: int, pix_fmt: str = 'yuv420p', preset: str = 'veryfast'):
++    """An ffmpeg process encoding raw RGB frames from its stdin to H.264 in `path`. In a session of its own:
++    stopping the simulator's process group mustn't kill it before it has finished the file (and if the
++    simulator dies, its stdin closes, and it finishes the file then)."""
++    import imageio_ffmpeg
++    return subprocess.Popen(
++        [imageio_ffmpeg.get_ffmpeg_exe(), '-loglevel', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb24',
++         '-s', f'{w}x{h}', '-r', f'{VIDEO_FPS:g}', '-i', '-', '-c:v', 'libx264', '-preset', preset,
++         '-crf', str(crf), '-pix_fmt', pix_fmt, '-movflags', '+faststart', path],
++        stdin=subprocess.PIPE, start_new_session=True)
++
++
++class VideoRecorder:
++    """Records what the viewer window shows, as a video drawn at full quality once the flight is over.
++
++    Drawing the window's picture offscreen during the flight got ~10 frames a second (every third frame,
++    repeated): under WSL2 every GL context, the viewer's and the FPV camera's too, goes through one
++    translation layer, and reading a frame back takes ~40 ms. So during the flight this only logs, each
++    1 / VIDEO_FPS of simulated time, what a frame needs: the bodies' poses, the propellers' turn, the
++    materials (LEDs), the viewer's camera and options, the markers and the RTF; and agent 0's FPV image and
++    the side panel as they change, into two small video streams. When the simulator stops, render_video()
++    draws every frame from that (_FrameDrawer, as the viewer draws it) in a process of its own and deletes
++    the log: `path` appears when it is done (launch.py waits for it and shows the progress).
++    With a viewer window: its camera (with --chase the follow view), its size, its overlays. Headless: the
++    follow view (ChaseCamera) at VIDEO_SIZE."""
++
++    def __init__(self, model: mujoco.MjModel, body_id: int, path: str, camera: 'CameraRenderer | None' = None):
++        try:
++            import imageio_ffmpeg  # noqa: F401
++        except ImportError:
++            raise RuntimeError('recording video needs imageio-ffmpeg (pip install imageio-ffmpeg; setup.cmd)')
++        if cv2 is None:
++            raise RuntimeError('recording video needs OpenCV (pip install opencv-python)')
++        model.vis.global_.offwidth = max(model.vis.global_.offwidth, VIDEO_MAX_SIZE[0])   # the offscreen
++        model.vis.global_.offheight = max(model.vis.global_.offheight, VIDEO_MAX_SIZE[1])  # buffer must fit
++        self.path, self.codec = os.path.abspath(path), 'H.264'
++        self.parts = self.path + '.parts'
++        shutil.rmtree(self.parts, ignore_errors=True)
++        os.makedirs(self.parts)
++        mujoco.mj_saveModel(model, os.path.join(self.parts, 'model.mjb'), None)
++        self._model, self._camera = model, camera
++        self._props = [b for b in range(model.nbody) if model.body(b).name.startswith('cf0_prop')]
++        self._viewer = self._picker = None
++        self.rtf = lambda: 0.0
++        self._chase = ChaseCamera(body_id)
++        self._period, self._acc = 1.0 / VIDEO_FPS, 1.0 / VIDEO_FPS
++        self._log = {k: [] for k in ('t', 'qpos', 'mocap_pos', 'mocap_quat', 'prop_quat', 'mat_rgba', 'cam_type',
++                                     'cam_lookat', 'cam_az', 'cam_el', 'cam_dist', 'cam_track', 'cam_fixed', 'rtf',
++                                     'opt', 'markers')}
++        self._opts, self._opt_index = [], {}     # distinct viewer options, and their index
++        self._marks, self._mark_index = [], {}   # distinct marker sets
++        self._size = None                        # (w, h, scale): the window's, once it has drawn
++        self._images = queue.Queue()             # per logged frame: (FPV image, its count), for the streams
++        self._streams, self._count = {}, {'fpv': 0, 'panel': 0}
++        self._index = {'fpv': [], 'panel': []}   # per logged frame: its frame in each stream (-1: none)
++        self._fpv_count = self._panel = self._panel_mtime = None
++        self._panel_new = False
++        self._thread = threading.Thread(target=self._stream_loop, daemon=True)
++        self._thread.start()
++
++    def attach_viewer(self, viewer, picker=None, rtf=None):
++        """Record what this viewer window shows (its camera, size, options, markers)."""
++        self._viewer, self._picker = viewer, picker
++        if rtf is not None:
++            self.rtf = rtf
++
++    def maybe_render(self, model: mujoco.MjModel, data: mujoco.MjData, dt: float):
++        """From the physics loop (inside the viewer's lock, with a viewer): log a frame when one is due."""
++        self._acc += dt
++        if self._acc < self._period:
++            return
++        self._acc -= self._period
++        v, log = self._viewer, self._log
++        if self._size is None and v is not None and v.viewport is not None and v.viewport.width > 0:
++            vp = v.viewport
++            s = min(1.0, VIDEO_MAX_SIZE[0] / vp.width, VIDEO_MAX_SIZE[1] / vp.height)
++            self._size = (int(vp.width * s) // 2 * 2, int(vp.height * s) // 2 * 2, s)  # even, as H.264 needs
++        if v is not None:
++            c = v.cam
++            cam = (int(c.type), c.lookat.copy(), float(c.azimuth), float(c.elevation), float(c.distance),
++                   int(c.trackbodyid), int(c.fixedcamid))
++            o = v.opt
++            key = (o.flags.tobytes(), o.geomgroup.tobytes(), o.sitegroup.tobytes(), int(o.frame), int(o.label))
++            if key not in self._opt_index:
++                self._opt_index[key] = len(self._opts)
++                self._opts.append([o.flags.tolist(), o.geomgroup.tolist(), o.sitegroup.tolist(), int(o.frame),
++                                   int(o.label)])
++            opt = self._opt_index[key]
++        else:
++            lookat, azimuth = self._chase.view(data)
++            cam = (int(mujoco.mjtCamera.mjCAMERA_FREE), lookat, azimuth, ChaseCamera.ELEVATION_DEG,
++                   ChaseCamera.DISTANCE_M, -1, -1)
++            opt = -1
++        marks = json.dumps(self._picker.markers if self._picker is not None else [])
++        if marks not in self._mark_index:
++            self._mark_index[marks] = len(self._marks)
++            self._marks.append(marks)
++        for k, x in zip(('t', 'qpos', 'mocap_pos', 'mocap_quat', 'prop_quat', 'mat_rgba', 'cam_type', 'cam_lookat',
++                         'cam_az', 'cam_el', 'cam_dist', 'cam_track', 'cam_fixed', 'rtf', 'opt', 'markers'),
++                        (data.time, data.qpos.copy(), data.mocap_pos.copy(), data.mocap_quat.copy(),
++                         model.body_quat[self._props].copy(), model.mat_rgba.copy(), *cam, self.rtf(), opt,
++                         self._mark_index[marks])):
++            log[k].append(x)
++        cam_r = self._camera
++        self._images.put((cam_r.latest_gray, cam_r.frames_rendered) if cam_r is not None else (None, None))
++
++    def _stream_loop(self):
++        """Writes the FPV image and the side panel to their streams when they change; notes per logged frame
++        which of their frames it shows."""
++        while True:
++            item = self._images.get()
++            if item is None:
++                return
++            fpv, count = item
++            if fpv is not None and count != self._fpv_count:
++                self._fpv_count = count
++                self._put('fpv', np.repeat(fpv[:, :, None], 3, axis=2))
++            self._index['fpv'].append(self._count['fpv'] - 1)
++            panel = self._read_panel()
++            if panel is not None and self._panel_new:
++                self._put('panel', panel)
++            self._index['panel'].append(self._count['panel'] - 1 if panel is not None else -1)
++
++    def _put(self, name: str, rgb: np.ndarray):
++        if name not in self._streams:
++            h, w = rgb.shape[:2]
++            self._streams[name] = (_ffmpeg_writer(os.path.join(self.parts, f'{name}.mkv'), w, h, crf=12,
++                                                  pix_fmt='yuv444p', preset='ultrafast'), (w, h))
++        proc, size = self._streams[name]
++        if (rgb.shape[1], rgb.shape[0]) != size:
++            rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
++        try:
++            proc.stdin.write(np.ascontiguousarray(rgb).tobytes())
++            self._count[name] += 1
++        except (BrokenPipeError, OSError):
++            pass
++
++    def _read_panel(self):
++        """The side panel another process writes (ViewerOverlay's format), or None if absent or stale;
++        _panel_new: it changed since last read."""
++        self._panel_new = False
++        try:
++            st = os.stat(OVERLAY_PANEL_PATH)
++        except OSError:
++            return None
++        if time.time() - st.st_mtime > OVERLAY_PANEL_STALE_S:
++            return None
++        if st.st_mtime_ns != self._panel_mtime:
++            try:
++                with open(OVERLAY_PANEL_PATH, 'rb') as f:
++                    data = f.read()
++                magic, w, h = struct.unpack_from('<4sHH', data)
++                if magic == b'CSO1' and len(data) == 8 + w * h * 3:
++                    self._panel = np.frombuffer(data, np.uint8, offset=8).reshape(h, w, 3)
++                    self._panel_mtime, self._panel_new = st.st_mtime_ns, True
++            except (OSError, struct.error, ValueError):
++                pass
++        return self._panel
++
++    def stop(self):
++        """Close the log, and start drawing the video from it in a process of its own."""
++        self._images.put(None)
++        self._thread.join(timeout=10.0)
++        for proc, _ in self._streams.values():
++            try:
++                proc.stdin.close()
++                proc.wait(timeout=20.0)
++            except (OSError, subprocess.TimeoutExpired):
++                pass
++        log, n = self._log, len(self._log['t'])
++        if not n:
++            shutil.rmtree(self.parts, ignore_errors=True)
++            return
++        w, h, scale = self._size or (*VIDEO_SIZE, 1.0)
++        arrays = {k: np.array(v) for k, v in log.items()}
++        arrays.update(fpv=np.array(self._index['fpv'][:n]), panel=np.array(self._index['panel'][:n]))
++        np.savez(os.path.join(self.parts, 'log.npz'), **arrays)
++        with open(os.path.join(self.parts, 'meta.json'), 'w') as f:
++            json.dump({'output': self.path, 'size': [w, h], 'scale': scale, 'props': self._props,
++                       'opts': self._opts, 'markers': [json.loads(m) for m in self._marks]}, f)
++        with open(os.path.join(self.parts, 'render.log'), 'w') as out:
++            subprocess.Popen([sys.executable, os.path.abspath(__file__), '--render-video', self.parts],
++                             stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
++        print(f'[crazysim] video: {n / VIDEO_FPS:.0f} s logged; drawing it to {self.path} '
++              f'({w} x {h}, {self.codec})', flush=True)
++
++
++class _Stream:
++    """Reads a stream VideoRecorder wrote, forward only: frame(i) is its frame i."""
++
++    def __init__(self, path: str):
++        self._cap = cv2.VideoCapture(path) if os.path.exists(path) else None
++        self._i, self._frame = -1, None
++
++    def frame(self, i: int, grey: bool = False):
++        if self._cap is None or i < 0:
++            return None
++        while self._i < i:
++            ok, img = self._cap.read()
++            if not ok:
++                break
++            self._i, self._frame = self._i + 1, img
++        if self._frame is None:
++            return None
++        return cv2.cvtColor(self._frame, cv2.COLOR_BGR2GRAY if grey else cv2.COLOR_BGR2RGB)
++
++
++def render_video(parts: str) -> int:
++    """Draw the video VideoRecorder logged in `parts`, frame by frame, as the viewer showed it; write the
++    progress to parts/progress; then move the video into place and delete the log."""
++    with open(os.path.join(parts, 'meta.json')) as f:
++        meta = json.load(f)
++    log = np.load(os.path.join(parts, 'log.npz'))
++    model = mujoco.MjModel.from_binary_path(os.path.join(parts, 'model.mjb'))
++    data = mujoco.MjData(model)
++    (w, h), scale, props = meta['size'], meta['scale'], meta['props']
++    opts = [(np.array(f, np.uint8), np.array(g, np.uint8), np.array(s, np.uint8), fr, lb)
++            for f, g, s, fr, lb in meta['opts']]
++    drawer = _FrameDrawer(model, w, h, scale)
++    fpv, panel = _Stream(os.path.join(parts, 'fpv.mkv')), _Stream(os.path.join(parts, 'panel.mkv'))
++    tmp = meta['output'] + '.drawing.mp4'
++    out = _ffmpeg_writer(tmp, w, h, VIDEO_CRF)
++    n = len(log['t'])
++    t0 = time.monotonic()
++    for k in range(n):
++        data.time = log['t'][k]
++        data.qpos[:] = log['qpos'][k]
++        data.mocap_pos[:], data.mocap_quat[:] = log['mocap_pos'][k], log['mocap_quat'][k]
++        model.body_quat[props] = log['prop_quat'][k]
++        model.mat_rgba[:] = log['mat_rgba'][k]
++        mujoco.mj_kinematics(model, data)
++        mujoco.mj_camlight(model, data)
++        cam = (int(log['cam_type'][k]), log['cam_lookat'][k], float(log['cam_az'][k]), float(log['cam_el'][k]),
++               float(log['cam_dist'][k]), int(log['cam_track'][k]), int(log['cam_fixed'][k]))
++        opt = opts[log['opt'][k]] if log['opt'][k] >= 0 else None
++        frame = drawer.draw(model, data, cam, opt, meta['markers'][log['markers'][k]], float(log['rtf'][k]),
++                            fpv.frame(int(log['fpv'][k]), grey=True), panel.frame(int(log['panel'][k])))
++        out.stdin.write(frame.tobytes())
++        if k % 30 == 0 or k == n - 1:
++            with open(os.path.join(parts, 'progress'), 'w') as f:
++                f.write(f'{k + 1} {n} {time.monotonic() - t0:.1f}')
++    out.stdin.close()
++    out.wait()
++    drawer.free()
++    os.replace(tmp, meta['output'])
++    shutil.rmtree(parts, ignore_errors=True)
++    print(f'[crazysim] video: {meta["output"]} ({n / VIDEO_FPS:.0f} s, drawn in {time.monotonic() - t0:.0f} s)')
++    return 0
++
++
++# ---------------------------------------------------------------------------
 +# Viewer picking: double-clicked points go to another process, which sends back markers to draw
 +# ---------------------------------------------------------------------------
 +PICK_PORT = int(os.environ.get('CRAZYSIM_PICK_PORT', '5310'))      # clicked points are sent here
@@ -244,6 +630,7 @@ index d4a7eb9..1fc8f89 100644
 +
 +    def __init__(self, viewer):
 +        self._v = viewer
++        self.markers = []  # the markers drawn now (VideoRecorder draws them too)
 +        self._out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 +        self._in = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 +        self._in.setblocking(False)
@@ -300,6 +687,7 @@ index d4a7eb9..1fc8f89 100644
 +            self._draw([])
 +
 +    def _draw(self, markers):
++        self.markers = list(markers)
 +        scn = self._v.user_scn
 +        with self._v.lock():
 +            scn.ngeom = 0
@@ -467,7 +855,38 @@ index d4a7eb9..1fc8f89 100644
  # ---------------------------------------------------------------------------
  # Directory containing this script — used to resolve scene.xml
  _HERE = os.path.dirname(os.path.abspath(__file__))
-@@ -985,35 +1382,31 @@ class DroneAgent:
+@@ -678,6 +1451,15 @@ class DroneAgent:
+ 
+         # Body ID and free joint qvel address
+         self._body_id = model.body(f'{prefix}drone').id
++        # Propeller bodies, to turn for the picture (PROP_VISUAL_SPEED): (motor, body id, mounting quaternion)
++        self._props = []
++        for i in range(4):
++            try:
++                b = model.body(f'{prefix}prop{i}').id
++            except KeyError:
++                continue
++            self._props.append((i, b, model.body_quat[b].copy()))
++        self._prop_angle = np.zeros(4)
+         jnt_id = model.body(f'{prefix}drone').jntadr[0]
+         self._qvel_adr = model.jnt_dofadr[jnt_id]  # 6 DOFs: [vx,vy,vz,wx,wy,wz]
+ 
+@@ -923,6 +1705,14 @@ class DroneAgent:
+         # Store rotor acceleration (RPM/s) for gyroscopic z-torque
+         self._rpm_dot = (self._rpm - rpm_prev) / self.dt
+ 
++        # Turn the propellers (for the picture): each the opposite way to its drag torque on the body
++        if self._props:
++            self._prop_angle -= MOTOR_DIR * self._rpm * (RPM_TO_RADS * PROP_VISUAL_SPEED * self.dt)
++            self._prop_angle %= 2.0 * math.pi
++            for i, b, (w, x, y, z) in self._props:
++                c, s = math.cos(0.5 * self._prop_angle[i]), math.sin(0.5 * self._prop_angle[i])
++                self.model.body_quat[b] = (w * c - z * s, x * c + y * s, y * c - x * s, z * c + w * s)
++
+     def apply_aero_effects(self):
+         """Apply aerodynamic drag via generalized forces (qfrc_applied).
+ 
+@@ -985,35 +1775,31 @@ class DroneAgent:
          return pos, q_xyzw
  
      def read_ranges(self) -> tuple[float, float, float, float, float]:
@@ -523,7 +942,7 @@ index d4a7eb9..1fc8f89 100644
  
          return tuple(ranges)
  
-@@ -1231,6 +1624,10 @@ class CrazySimMuJoCo:
+@@ -1231,6 +2017,10 @@ class CrazySimMuJoCo:
          # Build shared MuJoCo model with all drones
          self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
          self.model.opt.timestep = self.dt
@@ -534,16 +953,24 @@ index d4a7eb9..1fc8f89 100644
          self.data = mujoco.MjData(self.model)
  
          # Create per-drone agents
-@@ -1264,6 +1661,8 @@ class CrazySimMuJoCo:
+@@ -1264,6 +2054,16 @@ class CrazySimMuJoCo:
              )
              self.agents.append(agent)
  
 +        self._movers = MoverDriver(self.model)
 +        self._eye = CompoundEye(self.model, self.agents[0]._body_id) if self.agents else None
++        self._chase = ChaseCamera(self.agents[0]._body_id) if CHASE and self.agents else None
++        self._video = None
++        if VIDEO_PATH and self.agents:
++            try:
++                self._video = VideoRecorder(self.model, self.agents[0]._body_id, VIDEO_PATH, self.agents[0]._camera)
++                print(f'[crazysim] recording the view to {VIDEO_PATH} ({self._video.codec})')
++            except RuntimeError as e:
++                print(f'[crazysim] no video: {e}')
          self._running = False
  
      def _apply_downwash(self):
-@@ -1314,7 +1713,10 @@ class CrazySimMuJoCo:
+@@ -1314,7 +2114,12 @@ class CrazySimMuJoCo:
                  agent.update_led_materials()
              if self._downwash and self.num_agents > 1:
                  self._apply_downwash()
@@ -551,13 +978,51 @@ index d4a7eb9..1fc8f89 100644
              mujoco.mj_step(self.model, self.data)
 +            if self._eye is not None:
 +                self._eye.maybe_cast(self.model, self.data, self.dt)
++            if self._video is not None:
++                self._video.maybe_render(self.model, self.data, self.dt)
              for agent in self.agents:
                  agent.send_sensor_data()
  
-@@ -1334,14 +1736,38 @@ class CrazySimMuJoCo:
+@@ -1334,54 +2139,79 @@ class CrazySimMuJoCo:
                  _rtf_wall_start = wall_now
                  _rtf_sim_start = self.data.time
  
+-        if self.visualize:
+-            _render_interval = 1.0 / 60.0  # 60 FPS render rate
+-            with mujoco.viewer.launch_passive(self.model, self.data,
+-                                              show_left_ui=False,
+-                                              show_right_ui=False) as v:
+-                # Force initial camera: look from behind drone toward +X.
+-                _cam_init_frames = 5
+-                _last_render = 0.0
+-                while v.is_running() and self._running:
+-                    t0 = time.perf_counter()
+-                    with v.lock():
+-                        _step_and_send()
+-                        if _cam_init_frames > 0:
+-                            v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+-                            v.cam.azimuth = 0.0
+-                            v.cam.elevation = -20.0
+-                            v.cam.distance = 3.0
+-                            v.cam.lookat[:] = [0.0, 0.0, 0.5]
+-                            _cam_init_frames -= 1
+-                    _update_rtf()
+-                    if t0 - _last_render >= _render_interval:
+-                        v.set_texts((
+-                            mujoco.mjtFontScale.mjFONTSCALE_150,
+-                            mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
+-                            f'RTF: {_rtf_value:.2f}x',
+-                            f't={self.data.time:.1f}s',
+-                        ))
+-                        v.sync()
+-                        _last_render = t0
+-                    elapsed = time.perf_counter() - t0
+-                    sleep_t = self.dt - elapsed
+-                    if sleep_t > 0:
+-                        time.sleep(sleep_t)
+-            self._running = False
+-        else:
+-            try:
 +        def _pace(next_step):
 +            """Sleep until the next step's absolute deadline. Pacing each step by
 +            dt - elapsed never recovers time lost to slow steps (camera renders),
@@ -571,48 +1036,55 @@ index d4a7eb9..1fc8f89 100644
 +                next_step = time.perf_counter()
 +            return next_step
 +
-         if self.visualize:
-             _render_interval = 1.0 / 60.0  # 60 FPS render rate
-             with mujoco.viewer.launch_passive(self.model, self.data,
-                                               show_left_ui=False,
-                                               show_right_ui=False) as v:
-+                # set_texts() blocks until the viewer draws its next frame, which under
-+                # WSLg can take tens of ms; calling it from the physics loop throttled the
-+                # sim to a few % of real time. Overlays are drawn from their own thread.
-+                overlay = ViewerOverlay(
-+                    v, running=lambda: v.is_running() and self._running,
-+                    rtf=lambda: _rtf_value, sim_time=lambda: self.data.time,
-+                    camera=self.agents[0]._camera if self.agents else None,
-+                    picker=ViewerPicker(v))
-+                threading.Thread(target=overlay.run, daemon=True).start()
++        def _terminate(_signum, _frame):  # stopped from outside (launch.py, stop_sim.sh): finish cleanly,
++            raise KeyboardInterrupt       # so a video being recorded is a playable file
 +
-                 # Force initial camera: look from behind drone toward +X.
-                 _cam_init_frames = 5
-                 _last_render = 0.0
-+                _next_step = time.perf_counter()
-                 while v.is_running() and self._running:
-                     t0 = time.perf_counter()
-                     with v.lock():
-@@ -1355,29 +1781,17 @@ class CrazySimMuJoCo:
-                             _cam_init_frames -= 1
-                     _update_rtf()
-                     if t0 - _last_render >= _render_interval:
--                        v.set_texts((
--                            mujoco.mjtFontScale.mjFONTSCALE_150,
--                            mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
--                            f'RTF: {_rtf_value:.2f}x',
--                            f't={self.data.time:.1f}s',
--                        ))
-                         v.sync()
-                         _last_render = t0
--                    elapsed = time.perf_counter() - t0
--                    sleep_t = self.dt - elapsed
--                    if sleep_t > 0:
--                        time.sleep(sleep_t)
-+                    _next_step = _pace(_next_step)
-             self._running = False
-         else:
-             try:
++        signal.signal(signal.SIGTERM, _terminate)
++        try:
++            if self.visualize:
++                _render_interval = 1.0 / 60.0  # 60 FPS render rate
++                with mujoco.viewer.launch_passive(self.model, self.data,
++                                                  show_left_ui=False,
++                                                  show_right_ui=False) as v:
++                    # set_texts() blocks until the viewer draws its next frame, which under
++                    # WSLg can take tens of ms; calling it from the physics loop throttled the
++                    # sim to a few % of real time. Overlays are drawn from their own thread.
++                    picker = ViewerPicker(v)
++                    overlay = ViewerOverlay(
++                        v, running=lambda: v.is_running() and self._running,
++                        rtf=lambda: _rtf_value, sim_time=lambda: self.data.time,
++                        camera=self.agents[0]._camera if self.agents else None,
++                        picker=picker)
++                    threading.Thread(target=overlay.run, daemon=True).start()
++                    if self._video is not None:  # record what this window shows
++                        self._video.attach_viewer(v, picker, rtf=lambda: _rtf_value)
++
++                    # Force initial camera: look from behind drone toward +X.
++                    _cam_init_frames = 5
++                    _last_render = 0.0
++                    _next_step = time.perf_counter()
++                    while v.is_running() and self._running:
++                        t0 = time.perf_counter()
++                        render = t0 - _last_render >= _render_interval
++                        with v.lock():
++                            _step_and_send()
++                            if _cam_init_frames > 0:
++                                v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
++                                v.cam.azimuth = 0.0
++                                v.cam.elevation = -20.0
++                                v.cam.distance = 3.0
++                                v.cam.lookat[:] = [0.0, 0.0, 0.5]
++                                _cam_init_frames -= 1
++                            if self._chase is not None and render:
++                                self._chase.apply(v.cam, self.data)
++                        _update_rtf()
++                        if render:
++                            v.sync()
++                            _last_render = t0
++                        _next_step = _pace(_next_step)
++            else:
++                if self._video is not None:
++                    self._video.rtf = lambda: _rtf_value
 +                _next_step = time.perf_counter()
                  while self._running:
 -                    t0 = time.perf_counter()
@@ -622,10 +1094,25 @@ index d4a7eb9..1fc8f89 100644
 -                    sleep_t = self.dt - elapsed
 -                    if sleep_t > 0:
 -                        time.sleep(sleep_t)
+-            except KeyboardInterrupt:
+-                pass
 +                    _next_step = _pace(_next_step)
-             except KeyboardInterrupt:
-                 pass
++        except KeyboardInterrupt:
++            pass
  
+         self._running = False
++        if self._video is not None:
++            self._video.stop()
+         for agent in self.agents:
+             agent.stop()
+         print('[crazysim] Done.')
+@@ -1553,4 +2383,6 @@ def main():
+ 
+ 
+ if __name__ == '__main__':
++    if len(sys.argv) == 3 and sys.argv[1] == '--render-video':  # started by VideoRecorder.stop()
++        sys.exit(render_video(sys.argv[2]))
+     main()
 diff --git a/simulator_files/mujoco/launch/sitl_camera.sh b/simulator_files/mujoco/launch/sitl_camera.sh
 index 872721d..5488cfd 100755
 --- a/simulator_files/mujoco/launch/sitl_camera.sh

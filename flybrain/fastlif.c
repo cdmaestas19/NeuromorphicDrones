@@ -96,3 +96,115 @@ long lif_run(int n, int steps, int64_t t0,
     }
     return total;
 }
+
+static inline void wake(int i, int32_t *act, int32_t *nact, uint8_t *in_act) {
+    if (!in_act[i]) {
+        in_act[i] = 1;
+        act[(*nact)++] = i;
+    }
+}
+
+/* lif_run's steps, visiting only what can change: the neurons not at rest (a neuron at v = v_0, g = 0 is a
+ * fixed point of the update, and can't reach threshold) and the inputs actually queued. In the whole brain
+ * (~139k neurons) a looming test keeps a few thousand off rest: lif_run spent its time updating the others.
+ * The same result bit for bit: spikes are taken in index order, so every sum adds in lif_run's order.
+ * pend: D x n targets with input queued per ring row, npend: how many per row, mark: D x n queued flags.
+ * act / *nact / in_act: the neurons not at rest (the caller's, kept across calls; all empty at rest). */
+long lif_run_sparse(int n, int steps, int64_t t0,
+                    double *v, double *g, int64_t *last, const int32_t *rfc,
+                    double ev, double eg, double cvg, double v0, double vrst, double vth,
+                    const int32_t *row_ptr, const int32_t *post, const double *w,
+                    double *ring, int D, int delay,
+                    int32_t *pend, int32_t *npend, uint8_t *mark,
+                    int32_t *act, int32_t *nact, uint8_t *in_act,
+                    int n_in, const int32_t *idx_in, const double *p_in, double kick, const uint8_t *in_spikes,
+                    uint64_t *rng, int32_t *counts, int32_t *spk)
+{
+    long total = 0;
+    for (int s = 0; s < steps; s++) {
+        const int64_t t = t0 + s;
+        const int na = *nact;
+        for (int k = 0; k < na; k++) {
+            const int i = act[k];
+            if (t - last[i] >= rfc[i]) {
+                const double gi = g[i];
+                double u = (v[i] - v0) * ev + gi * cvg, gn = gi * eg;
+                if (u < TINY && u > -TINY)
+                    u = 0.0;
+                if (gn < TINY && gn > -TINY)
+                    gn = 0.0;
+                v[i] = v0 + u;
+                g[i] = gn;
+            }
+        }
+        int ns = 0;
+        for (int k = 0; k < na; k++) {
+            const int i = act[k];
+            if (v[i] > vth && t - last[i] >= rfc[i]) {
+                spk[ns++] = i;
+                last[i] = t;
+                counts[i]++;
+            }
+        }
+        for (int a = 1; a < ns; a++) {  /* index order, as lif_run finds them (few per step: insertion sort) */
+            const int x = spk[a];
+            int b = a - 1;
+            while (b >= 0 && spk[b] > x) {
+                spk[b + 1] = spk[b];
+                b--;
+            }
+            spk[b + 1] = x;
+        }
+        const size_t row = (size_t)(t % D);
+        double *due = ring + row * (size_t)n;
+        int32_t *pq = pend + row * (size_t)n;
+        uint8_t *mq = mark + row * (size_t)n;
+        for (int k = 0; k < npend[row]; k++) {
+            const int i = pq[k];
+            if (t - last[i] >= rfc[i]) {
+                g[i] += due[i];
+                wake(i, act, nact, in_act);
+            }
+            due[i] = 0.0;
+            mq[i] = 0;
+        }
+        npend[row] = 0;
+        const size_t lrow = (size_t)((t + delay) % D);
+        double *later = ring + lrow * (size_t)n;
+        int32_t *pl = pend + lrow * (size_t)n;
+        uint8_t *ml = mark + lrow * (size_t)n;
+        for (int k = 0; k < ns; k++) {
+            const int i = spk[k];
+            for (int j = row_ptr[i]; j < row_ptr[i + 1]; j++) {
+                const int q = post[j];
+                later[q] += w[j];
+                if (!ml[q]) {
+                    ml[q] = 1;
+                    pl[npend[lrow]++] = q;
+                }
+            }
+        }
+        for (int k = 0; k < n_in; k++) {
+            const int fire = in_spikes ? in_spikes[(size_t)s * (size_t)n_in + (size_t)k] : uniform(rng) < p_in[k];
+            if (fire) {
+                v[idx_in[k]] += kick;
+                wake(idx_in[k], act, nact, in_act);
+            }
+        }
+        for (int k = 0; k < ns; k++) {
+            v[spk[k]] = vrst;
+            g[spk[k]] = 0.0;
+        }
+        int keep = 0;  /* back at rest: off the list */
+        for (int k = 0; k < *nact; k++) {
+            const int i = act[k];
+            if (v[i] == v0 && g[i] == 0.0)
+                in_act[i] = 0;
+            else
+                act[keep++] = i;
+        }
+        *nact = keep;
+        total += ns;
+    }
+    return total;
+}

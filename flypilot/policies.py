@@ -7,12 +7,14 @@ from POLICIES and never depend on a particular one.
                   ready: it mistakes oblique static surfaces for movers and its maneuver re-triggers in
                   clutter (the square and blocked routes time out)
     flybrain      360-degree compound eye -> looming per eye -> the fly connectome's escape circuit (flybrain/)
+    looming       the same, without the connectome: a threshold on the looming (the abstract looming model arm)
 """
 import json
 import math
 import socket
 import time
 from collections import Counter, deque
+from pathlib import Path
 
 import numpy as np
 
@@ -228,7 +230,7 @@ class GeometricTTCPolicy(AvoidancePolicy):
         looms most while avoiding: its kind by the eye's size of it, and by the camera when it sees it."""
         if s.eye is not None and s.eye is not self._kind_reading:
             self._kind_reading = s.eye
-            self._eye.update(s.eye, s.yaw_deg, s.route_stop_m)
+            self._eye.update(s.eye, s.yaw_deg, s.route_stop_m, s.mapped)
         seen = _camera_look(self._camera, self._eye, s, frame) if s.eye is not None else None
         if s.mode is Mode.AVOID and s.eye is not None:
             self._kinds.add(self._eye.threat_kind)
@@ -589,6 +591,7 @@ class FlyBrainPolicy(AvoidancePolicy):
     """
 
     name = 'Fly brain (connectome)'
+    alarm_label = 'giant fibers'  # what its alarm rates are, for the flight's log
     inputs = ('360 eye', 'fly brain', 'multiranger')
     needs_eye = True         # no fallback: the eye is its sense of looming
     needs_camera = False     # the camera tells it what a threat is (camera_kind.py) when it is in view
@@ -643,9 +646,6 @@ class FlyBrainPolicy(AvoidancePolicy):
         self.inputs = type(self).inputs + (('camera',) if self._camera else ()) + ('map',)
         self.input_notes = {'multiranger': 'up: room to climb', 'camera': 'person / vehicle',
                             'map': 'which side is shorter'}
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.settimeout(self.REPLY_TIMEOUT_S)
-        self._addr = ('127.0.0.1', port)
         self._tick, self._reading = 0, None
         self.gf = [0.0, 0.0]     # smoothed giant-fiber rates, Hz (left, right)
         self.steer = [0.0, 0.0]  # smoothed steering-DN rates, Hz (left, right)
@@ -654,8 +654,55 @@ class FlyBrainPolicy(AvoidancePolicy):
         self.late_ticks = 0      # ticks the brain's newest answer was older than one tick (a slow brain)
         self.side_sources = Counter()  # per episode, what chose the side: brain, eye, map, motion (summary())
         self._stats = deque(maxlen=20 * 60 * 30)  # (drive L, drive R, GF L, GF R, brain ms) per tick, <= 30 min
-        self.brain_ok = self._reset_brain()
+        self._connect(port)
         self.reset()
+
+    def _connect(self, port: int):
+        """The decider: here the brain server (flybrain/brain_server.py). brain_ok False if it doesn't answer."""
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.settimeout(self.REPLY_TIMEOUT_S)
+        self._addr = ('127.0.0.1', port)
+        self.brain_outputs = self.brain_circuit = None
+        self.brain_ok = self._reset_brain()
+
+    def _think(self, drive: tuple):
+        """One tick of the decider: send this tick's input to the brain, read its newest answer (usually the
+        previous tick's: the brain finished it ~2 ms after) with _read()."""
+        self._sock.sendto(json.dumps(self._message(drive)).encode(), self._addr)
+        if self._tick > 0:
+            reply = self._newest_reply()
+            if reply is not None:
+                self._read(reply)
+        self._tick += 1
+
+    def _message(self, drive: tuple) -> dict:
+        """This tick's step for the brain: each eye's looming drive (two channels)."""
+        return {'type': 'step', 'tick': self._tick, 'drive': drive}
+
+    def _read(self, reply: dict):
+        """A brain answer into the smoothed giant-fiber and steering-DN rates (self.gf, self.steer, Hz)."""
+        self.late_ticks += self._tick - 1 - reply['tick']
+        self.brain_ms = reply.get('compute_ms')
+        dn = reply.get('dn', {})
+        steer = [sum(n for k, n in dn.items() if k.split(' ')[0] in self.STEER_DNS and side in k)
+                 for side in ('(left)', '(right)')]
+        for k in (0, 1):
+            self.gf[k] += self.SMOOTH * (reply['gf'][k] / self.TICK_S - self.gf[k])
+            self.steer[k] += self.SMOOTH * (steer[k] / self.TICK_S - self.steer[k])
+
+    def _brain_side(self) -> tuple:
+        """(how clearly the brain says a side, 0..1; the side away from the threat, +1 left / -1 right): away
+        from the stronger steering DNs, as clearly as they are lateralized."""
+        lateral = (self.steer[0] - self.steer[1]) / max(self.steer[0] + self.steer[1], 1e-6)
+        return abs(lateral), (-1.0 if self.steer[0] >= self.steer[1] else 1.0)
+
+    def _brain_along(self) -> float:
+        """Forward (+1, the looming is all behind) to back (-1, all ahead): the eye's (front_back), since the
+        brain's two input channels can't tell. Sets self._along_from."""
+        ahead, behind = self.looming.front_back
+        along = 2.0 * (behind - ahead) / max(ahead, behind) if max(ahead, behind) > 0.0 else 0.0
+        self._along_from = 'eye'
+        return min(max(along, -1.0), 1.0)
 
     def summary(self) -> str:
         """For the end-of-flight log: what the eyes and the giant fibers did, and what the brain cost."""
@@ -673,7 +720,9 @@ class FlyBrainPolicy(AvoidancePolicy):
         self._sock.settimeout(5.0)
         try:
             self._sock.sendto(json.dumps({'type': 'reset'}).encode(), self._addr)
-            self._sock.recv(4096)
+            reply = json.loads(self._sock.recv(65535))
+            self.brain_outputs = reply.get('outputs')  # their names, in 'out' order
+            self.brain_circuit = reply.get('circuit')  # which circuit (flybrain/circuit.py CIRCUITS)
             return True
         except OSError:
             return False
@@ -687,18 +736,20 @@ class FlyBrainPolicy(AvoidancePolicy):
         self._side = self._burst_end = None  # the brain itself is only reset per flight
         self._along = self._v_forward = 0.0
         self._side_from, self._escape_from, self._map_cost = 'brain', '', (math.nan, math.nan)
+        self._along_from = ''
         self._out_of_path = self._escape_world = None
         self._v_out = self.V_ESCAPE
         self._will_be, self._n0 = [], None  # the drone's projected offsets from the mover's line, while choosing
         self._kinds = _ThreatKinds()
         self._episode_t0, self._episode_z0 = None, 0.0
 
-    def _map_sides(self, s: Sensors) -> tuple:
+    def _map_sides(self, s: Sensors, pts: np.ndarray | None = None) -> tuple:
         """(route on to the stop if the drone goes round the threat on its left, ... on its right), from the
-        planner's map: via a point PASS_BESIDE_M beside the eye's points of the threat and PASS_PAST_M past
-        their far end. The threat itself isn't on the map (else the planner would have gone round it):
-        these points are what make going round its far side cost more. nan without a map or a threat."""
-        pts = self.looming.threat_points
+        planner's map: via a point PASS_BESIDE_M beside the eye's points of the threat (or `pts`) and
+        PASS_PAST_M past their far end. The threat itself isn't on the map (else the planner would have gone
+        round it): these points are what make going round its far side cost more. nan without a map or a
+        threat."""
+        pts = self.looming.threat_points if pts is None else pts
         if s.route_cost is None or not len(pts):
             return math.nan, math.nan
         x, y = s.position[0], s.position[1]
@@ -800,7 +851,7 @@ class FlyBrainPolicy(AvoidancePolicy):
         newest = None
         while True:
             try:
-                reply = json.loads(self._sock.recv(4096))
+                reply = json.loads(self._sock.recv(65535))
             except (BlockingIOError, ValueError):
                 break
             except OSError:
@@ -818,21 +869,9 @@ class FlyBrainPolicy(AvoidancePolicy):
         reading = s.eye
         if reading is not None and reading is not self._reading:
             self._reading = reading
-            self.looming.update(reading, s.yaw_deg, s.route_stop_m)  # with an efference copy of the route
+            self.looming.update(reading, s.yaw_deg, s.route_stop_m, s.mapped)  # with an efference copy of the route
         drive = tuple(min(d * g, 1.0) for d, g in zip(self.looming.drive(), self.EYE_GAIN))
-        self._sock.sendto(json.dumps({'type': 'step', 'tick': self._tick, 'drive': drive}).encode(), self._addr)
-        if self._tick > 0:  # usually the reply to the previous tick (the brain finished it ~25 ms ago)
-            reply = self._newest_reply()
-            if reply is not None:
-                self.late_ticks += self._tick - 1 - reply['tick']
-                self.brain_ms = reply.get('compute_ms')
-                dn = reply.get('dn', {})
-                steer = [sum(n for k, n in dn.items() if k.split(' ')[0] in self.STEER_DNS and side in k)
-                         for side in ('(left)', '(right)')]
-                for k in (0, 1):
-                    self.gf[k] += self.SMOOTH * (reply['gf'][k] / self.TICK_S - self.gf[k])
-                    self.steer[k] += self.SMOOTH * (steer[k] / self.TICK_S - self.steer[k])
-        self._tick += 1
+        self._think(drive)
 
         threat = max(self.gf) / self.GF_FULL_HZ
         signal = threat if threat < 1.0 else 1.0
@@ -845,11 +884,10 @@ class FlyBrainPolicy(AvoidancePolicy):
             if self._burst_end is None or (s.t > self._burst_end + self.REARM_S and signal >= self.BURST_AGAIN):
                 if self._side is None:  # once per episode: changing sides between bursts leaves it in the way
                     self._episode_t0, self._episode_z0 = s.t, s.position[2]
-                    lateral = (self.steer[0] - self.steer[1]) / max(self.steer[0] + self.steer[1], 1e-6)
-                    brain = -1.0 if self.steer[0] >= self.steer[1] else 1.0  # away from the stronger DNs
+                    lateral, brain = self._brain_side()
                     self._map_cost = self._map_sides(s)
                     pick = _map_choice(*self._map_cost)  # +1: round it on the left is shorter, -1: on the right
-                    if abs(lateral) >= self.SIDE_CLEAR:
+                    if lateral >= self.SIDE_CLEAR:
                         self._side, self._side_from = brain, 'brain'
                         if _map_choice(*self._map_cost, MAP_OVERRULE_M) == -brain:  # the brain's way is far longer
                             self._side, self._side_from = -brain, 'map'
@@ -864,9 +902,7 @@ class FlyBrainPolicy(AvoidancePolicy):
                         self._side, self._side_from = brain, 'brain'
                     if pick == -self._side and math.isinf(self._map_cost[0 if self._side > 0 else 1]):
                         self._side, self._side_from = -self._side, 'map'  # that way runs into something mapped
-                ahead, behind = self.looming.front_back
-                along = 2.0 * (behind - ahead) / max(ahead, behind) if max(ahead, behind) > 0.0 else 0.0
-                self._along = min(max(along, -1.0), 1.0)  # +1: all of it behind, -1: all ahead
+                self._along = self._brain_along()  # +1: all of it behind, -1: all ahead
                 # Unless the threat is ahead, don't brake: stopping in front of something coming from
                 # behind or from the side (a cart down the road) only lets it close faster.
                 self._v_forward = self._along * self.V_ESCAPE
@@ -913,7 +949,220 @@ class FlyBrainPolicy(AvoidancePolicy):
                 'maneuver': maneuver, 'threat_kind': self._kinds.label(), 'camera_kind': _camera_text(self._camera),
                 'side_from': (self._escape_from if self._escape_world is not None else self._side_from)
                 if s.mode is Mode.AVOID else '',
+                'along_from': self._along_from if s.mode is Mode.AVOID and self._escape_world is None else '',
                 'map_left': _cost(self._map_cost[0]), 'map_right': _cost(self._map_cost[1])}
+        return AvoidCommand(signal, dodge, info)
+
+
+class LoomingModelPolicy(FlyBrainPolicy):
+    """Comparison arm: the abstract looming model. Everything the fly-brain policy has (the 360-degree eye,
+    its looming and collision-course selectivity, the same escapes, the map, person / vehicle) except the
+    connectome: the alarm is a threshold on the looming itself, the brain's own input.
+
+    Its alarm rate (in place of the giant fibers') is linear in the two eyes' summed looming drive: ALARM_HZ,
+    the supervisor's threshold, at ALARM_DRIVE, the summed drive at which the brain raises the alarm with
+    looming on both eyes (2 x 0.065, flybrain/README.md). So head-on both raise the alarm at the same
+    looming; the brain's response is nonlinear, weighs the eyes unequally and has dynamics of its own.
+    Which way: away from the eye that sees more looming (the brain: away from the stronger steering DNs).
+    The same one-tick delay as the brain's answer and the same smoothing: the decider is the only
+    difference. If this flies as well as the fly brain, the wiring adds nothing the looming signal didn't
+    already carry."""
+
+    name = 'Looming model (no connectome)'
+    alarm_label = 'looming alarm'
+    inputs = ('360 eye', 'multiranger')
+    description = '360-degree looming -> a threshold on the summed looming (the brain\'s input; no connectome)'
+    EYE_GAIN = (1.0, 1.0)  # no connectome asymmetry to calibrate for
+    ALARM_DRIVE = 0.13
+    ALARM_HZ = 50.0        # 0.5 (the supervisor's enter threshold) x GF_FULL_HZ
+
+    def _connect(self, port: int):
+        self.brain_ok, self._prev = True, (0.0, 0.0)
+
+    def _think(self, drive: tuple):
+        """The alarm and steering rates from the previous tick's looming (the brain answers a tick late too)."""
+        left, right = self._prev
+        rate = self.ALARM_HZ * (left + right) / self.ALARM_DRIVE
+        for k, d in enumerate((left, right)):
+            self.gf[k] += self.SMOOTH * (rate - self.gf[k])
+            self.steer[k] += self.SMOOTH * (d - self.steer[k])
+        self._prev, self.brain_ms = drive, 0.0
+        self._tick += 1
+
+    def summary(self) -> str:
+        if not self._stats:
+            return 'looming model: no decisions'
+        a = np.array(self._stats)
+        p = lambda c: f'median {np.median(a[:, c]):.2f} / 95% {np.percentile(a[:, c], 95):.2f} / max {a[:, c].max():.2f}'  # noqa: E731
+        return (f'looming model over {len(a)} ticks: eye drive L {p(0)}, R {p(1)}; alarm Hz {p(2)}; '
+                f'{self.bursts} escape bursts; side chosen by: '
+                + (', '.join(f'{k} {n}' for k, n in self.side_sources.most_common()) or 'no episodes'))
+
+
+class FlyBrainRFPolicy(FlyBrainPolicy):
+    """The fly brain with each looming detector seeing its own patch, and a small trained readout.
+
+    The same circuit, but each of its 314 LC4 / LPLC2 neurons is driven by the looming inside its own receptive
+    field (derived from the connectome: flybrain/retinotopy.py; the eye sends its looming per ommatidium,
+    eye.Looming.loom_points), not by its whole eye's. The descending neurons then carry where the threat is.
+    A small trained readout (flybrain/train_readout.py: linear, from the 37 output neurons' smoothed rates;
+    models/brain_readout.npz) turns them into the threat's bearing, and the escape goes away from it, as a
+    fly's escape takeoff goes away from the looming: sideways to the far side, forward or back away from it.
+
+    When: the giant fibers, as FlyBrainPolicy. Which way, for a threat standing still: the readout (side and
+    forward/back), unless it is unsure (READOUT_SURE) or the threat is within SIDE_CLEAR of straight ahead or
+    behind (then the map, then the eye, as before). For a moving threat, out of its path: that needs where it
+    is heading, which one look at the looming doesn't give; the eye's tracker still supplies it
+    (FlyBrainPolicy._mover_escape), with the readout's side for a mover coming straight down the line."""
+
+    name = 'Fly brain (receptive fields, trained readout)'
+    inputs = ('360 eye', 'fly brain', 'readout', 'multiranger')
+    description = ('360-degree looming per ommatidium -> each LC4/LPLC2 its own receptive field -> FlyWire escape '
+                   'circuit -> trained readout of 37 descending neurons: where the threat is')
+    MODELS = Path(__file__).resolve().parent / 'models'  # brain_readout_<circuit>.npz, one per brain circuit
+    SIDE_CLEAR = math.sin(math.radians(15))  # the readout picks the side of a threat at least this far off the axis
+    READOUT_SURE = 0.5       # ...when its (cos, sin) is at least this long (it is ~1 for a clear bearing)
+
+    def __init__(self, port: int = FlyBrainPolicy.PORT):
+        self.bearing, self.sure = 0.0, 0.0     # the readout: where the threat is (deg, + left), how surely
+        super().__init__(port)
+        self.input_notes['readout'] = 'where the threat is'
+        circuit = self.brain_circuit or 'h3'  # a server from before circuits had names ran the 3-hop cut
+        self.model = self.MODELS / f'brain_readout_{circuit}.npz'
+        if not self.model.is_file():
+            raise SystemExit(f'no readout for the brain circuit "{circuit}" ({self.model.name}): run '
+                             f'flybrain/train_readout.py --circuit {circuit}')
+        m = np.load(self.model)
+        self._names, self._mu, self._sd, self._w = [str(n) for n in m['names']], m['mu'], m['sd'], m['w']
+        self.out = np.zeros(len(self._names))  # smoothed output rates, Hz, in the server's 'out' order
+        if self.brain_ok and self.brain_outputs != self._names:
+            raise SystemExit(f'the brain server\'s outputs are not the ones {self.model.name} was trained on: '
+                             f're-run flybrain/train_readout.py --circuit {circuit}')
+
+    def _message(self, drive: tuple) -> dict:
+        msg = super()._message(drive)
+        msg['loom'] = np.round(self.looming.loom_points(), 3).tolist()
+        return msg
+
+    def _read(self, reply: dict):
+        super()._read(reply)
+        if 'out' in reply:
+            self.out += self.SMOOTH * (np.asarray(reply['out'], float) / self.TICK_S - self.out)
+            p = np.append((np.sqrt(np.maximum(self.out, 0.0)) - self._mu) / self._sd, 1.0) @ self._w
+            self.bearing, self.sure = math.degrees(math.atan2(p[1], p[0])), float(math.hypot(p[0], p[1]))
+
+    def _brain_side(self) -> tuple:
+        if self.sure < self.READOUT_SURE:
+            return 0.0, 1.0
+        s = math.sin(math.radians(self.bearing))
+        return abs(s), (-1.0 if s > 0.0 else 1.0)  # away from the threat
+
+    def _brain_along(self) -> float:
+        if self.sure < self.READOUT_SURE:
+            return super()._brain_along()
+        self._along_from = 'brain'
+        return -math.cos(math.radians(self.bearing))  # threat ahead: back; behind: forward
+
+    def step(self, s: Sensors, frame: np.ndarray | None) -> AvoidCommand:
+        cmd = super().step(s, frame)
+        cmd.info['bearing'], cmd.info['readout_sure'] = self.bearing, self.sure
+        return cmd
+
+
+class FlyBrainCamPolicy(FlyBrainRFPolicy):
+    """AI-deck camera -> fly brain -> trained readout; the range sensors for what the camera can't see.
+
+    The brain's only sight is the camera: image motion -> LPLC2-like looming units over the middle of its
+    view (camera_loom.py), then the same receptive fields, circuit and trained readout as FlyBrainRFPolicy.
+    It never reads the 360-degree eye: no object tracking, no collision geometry, nothing about where a mover
+    is heading, so an escape the brain leads goes where the readout says (away from the threat, as a fly's
+    takeoff) or, for a threat nearly straight ahead, the shorter way round on the map.
+    Beside and behind, out of the camera's view, the Multi-ranger's side and back rays watch with the
+    geometric time-to-collision rule (GeometricTTCPolicy): the conventional controller's own sensing, as on
+    the real drone. Ahead the brain decides; the front ray is a safety net under it (FRONT_NET: it alarms at
+    ~1 s to contact where the others do at 2 s), since the camera's looming catches about half of what
+    loomed ahead in time (flybrain/README.md). The alarm is the stronger; whichever raised it leads that
+    episode's escape. (The flight's own rules around every policy still use the eye: avoid_demo's speed caps
+    and _dodge_safe.)"""
+
+    name = 'Fly brain on the camera (EXPERIMENTAL)'
+    inputs = ('camera', 'fly brain', 'readout', 'multiranger')
+    needs_eye = False
+    needs_camera = True
+    description = ('AI-deck camera: looming -> each LC4/LPLC2 its own receptive field -> FlyWire escape circuit -> '
+                   'trained readout; Multi-ranger: time-to-collision beside and behind, a safety net ahead')
+    FRONT_NET = 0.5  # the front ray's threat counts this much (the supervisor's 0.5 at ~1 s to contact, not 2 s)
+    V_ESCAPE = 0.6   # m/s: it can't tell a person walking at it from a crate (no eye: no tracking), so it gets
+                     # out of the way as from the faster (FlyBrainPolicy's 0.4 is for what stands or walks past)
+
+    def _brain_side(self) -> tuple:
+        """The readout's side; when it can't say (a threat nearly straight ahead or behind), the side the
+        range sensors see more room on."""
+        strength, side = super()._brain_side()
+        if strength < self.SIDE_CLEAR and self._s is not None:
+            side = 1.0 if self._s.ranges.get('left', math.inf) >= self._s.ranges.get('right', math.inf) else -1.0
+        return strength, side
+
+    def __init__(self, port: int = FlyBrainPolicy.PORT):
+        from camera_loom import CameraLooming
+        self.cam_looming = CameraLooming()
+        self._frame, self._loom, self._s = None, np.zeros((0, 3)), None
+        self._ranges = GeometricTTCPolicy()
+        self._lead = None  # what raised this episode's alarm: 'brain' (the camera) or 'ranges'
+        super().__init__(port)
+        self.input_notes.update({'camera': 'looming ahead', 'multiranger': 'sides and back'})
+
+    def reset(self):
+        if getattr(self, '_lead', None) == 'ranges' and getattr(self, '_episode_t0', None) is not None:
+            self.side_sources['ranges'] += 1
+            self._episode_t0 = None  # the range sensors' episode, not the brain's
+        super().reset()
+        self._ranges.reset()
+        self._lead = None
+
+    def _message(self, drive: tuple) -> dict:
+        msg = FlyBrainPolicy._message(self, drive)
+        msg['loom'] = np.round(self._loom, 3).tolist()
+        return msg
+
+    MAP_AHEAD_DEG = 30.0  # a threat the readout puts within this of straight ahead is where the front ray hits
+
+    def _map_sides(self, s: Sensors, pts: np.ndarray | None = None) -> tuple:
+        """As FlyBrainPolicy's, with the threat placed by the readout's bearing at the front ray's distance
+        (there is no eye to give its points)."""
+        d = s.ranges.get('front', math.inf)
+        if not math.isfinite(d) or self.sure < self.READOUT_SURE or abs(self.bearing) > self.MAP_AHEAD_DEG:
+            return math.nan, math.nan
+        a = math.radians(s.yaw_deg + self.bearing)
+        return super()._map_sides(s, np.array([[s.position[0] + d * math.cos(a), s.position[1] + d * math.sin(a)]]))
+
+    def step(self, s: Sensors, frame: np.ndarray | None) -> AvoidCommand:
+        from camera_loom import gate
+        self._s = s
+        if frame is not None and frame is not self._frame:
+            self._frame = frame
+            self.cam_looming.update(frame, s.t, s.yaw_deg)
+        # what looms, less the drone's own approach to what the route and the map already deal with
+        self._loom = gate(self.cam_looming.loom_points(), s.position, s.yaw_deg, s.velocity_body, s.route_stop_m,
+                          s.on_map)
+        blind = s._replace(eye=None)  # the policy's senses: camera, range sensors, map
+        rays = self._ranges.step(blind, None)
+        cmd = super().step(blind, frame)
+        r = rays.info
+        watch = max(self.FRONT_NET * r['threat_front'], r['threat_back'], r['threat_left'], r['threat_right'])
+        if s.mode is Mode.AVOID:
+            if self._lead is None:
+                self._lead = 'ranges' if watch > cmd.signal else 'brain'
+        else:
+            self._lead = None
+        info = dict(cmd.info)
+        dodge, signal = cmd.dodge, max(cmd.signal, watch)
+        if self._lead == 'ranges':  # its maneuver, and its signal (held while the maneuver lasts)
+            dodge, signal = rays.dodge, max(cmd.signal, rays.signal)
+            info.update(maneuver=rays.info.get('maneuver', ''), side_from='ranges')
+        loom = self.cam_looming.loom
+        info.update(camera_loom=float(loom.max()) if loom is not None else 0.0, range_signal=watch,
+                    lead=self._lead or '')
         return AvoidCommand(signal, dodge, info)
 
 
@@ -921,4 +1170,7 @@ POLICIES = {
     'geometric': GeometricTTCPolicy,
     'geometric360': GeometricTTC360Policy,
     'flybrain': FlyBrainPolicy,
+    'flybrain-rf': FlyBrainRFPolicy,
+    'flybrain-cam': FlyBrainCamPolicy,
+    'looming': LoomingModelPolicy,
 }

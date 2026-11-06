@@ -57,6 +57,7 @@ flypilot\launch.cmd avoid --route headon --policy flybrain
 
   | Route | What happens |
   |---|---|
+  | `showcase` | **everything at once:** dodges two trees at cruise height (they aren't on its map), then lands beside the walkway as a person walks past |
   | `hover` | a person walks up behind the hovering drone |
   | `headon` | a person walks at the drone |
   | `crossing` | a person crosses its path |
@@ -69,7 +70,23 @@ flypilot\launch.cmd avoid --route headon --policy flybrain
   | `square` | open floor: the false-alarm test |
   | `blocked` | an unmapped crate on the path |
 
-- **Compare with the geometric rule:** leave out `--policy flybrain`.
+- **Compare with the other arms:** leave out `--policy flybrain` for the geometric rule, or use
+  `--policy looming` for the abstract looming model (the fly brain's eye and escapes without the
+  connectome: a threshold on the looming).
+- **The fly brain's newer versions:** `--policy flybrain-rf` gives each of the brain's looming neurons
+  its own patch of the view, with a trained readout saying where the threat is. `--policy flybrain-cam`
+  (experimental) does the same on the AI-deck camera, with the range sensors for the rest
+  (../flybrain/README.md).
+- **Film it:** `flypilot\showcase.cmd` flies the showcase with the 3D view following the drone from
+  behind and a little above, and records the 3D window to `flypilot\videos\showcase_<date_time>.mp4`.
+  The recording looks exactly like the window: the drone's own camera top-left, the dashboard on the
+  right, the RTF and time, the stop markers. It is drawn at full quality, every frame, *after* the flight:
+  when the sim closes, the terminal shows the progress, which takes about as long as the flight; Ctrl-C
+  stops waiting but not the drawing. Any route can do the same: add `--chase` (the 3D view follows the
+  drone) and `--video videos\NAME.mp4` (also with `--headless`: then the follow view, without the
+  dashboard). While `--chase` is on, the mouse can't move the view.
+- **The propellers turn** at 1/40 of their real speed. Real ones turn ~250 times a second, which no
+  screen or video shows: at 30 or 60 frames a second they would look still or run backwards.
 - **Where the windows open:** on a screen other than your main one, if you have two. `--screen main`
   keeps them on the main screen; `--headless` opens no windows at all (run tests while you use the PC
   for something else).
@@ -320,6 +337,8 @@ along the south wall, with no room to pass it on the wall side.
 | `flypilot\launch.cmd ... --screen main` | where the windows open: `auto` (default: a screen other than the main one, if there is one), `main`, `1`, `2`, ..., `off` (`screens.py`) |
 | `flypilot\launch.cmd ... --headless` | no windows at all: for test runs while the PC is used for something else (a game). The flight and its log are the same |
 | `flypilot\brain_reproduce.cmd`, `flypilot\brain_validate.cmd` | check the fly-brain model against published results, and its cut-out escape circuit against the whole brain (see [../flybrain/README.md](../flybrain/README.md)) |
+| `flypilot\brain_prune.cmd` | run the whole brain on many looming tests, keep the neurons that fire (the flown circuit), and check it on held-out tests (see [../flybrain/README.md](../flybrain/README.md)) |
+| `flypilot\launch.cmd ... --brain-circuit h3` | fly-brain policies: which circuit the brain runs (`active`, the default: pruned by activity; `h3` / `h4`: cut by wiring) |
 | `flypilot\launch.cmd avoid --record recordings\blocked.jsonl` | also saves every decision's inputs and outputs |
 | `flypilot\bench.cmd recordings\blocked.jsonl [--policy NAME]` | replays a recording offline (no sim needed), checks the decisions still match the recording, and prints the cost per decision |
 | `flypilot\run_sim.cmd`, `flypilot\camera.cmd` | the sim, or the separate camera window, on their own (one terminal each) |
@@ -405,13 +424,24 @@ The avoidance runs on every tick the drone is flying a leg or hovering at a stop
     its path.
   - **Down only when clear below.** After a dodge climbed, or when descending to a stop, the drone goes
     down only while the eye's downward-looking rows see room under it (within 0.6 m of it: a tall wall
-    beside the drone isn't under it).
-  - **Remember what was dodged.** After each episode, unmapped static things the eye saw nearby go on
-    the planner's map (orange dots), so the re-planned path goes round them.
+    beside the drone isn't under it). Something on the map counts only right under the drone (0.2 m):
+    the planned path keeps its distance from it anyway. So a crate beside the landing spot no longer
+    holds the landing, and crates and partitions beside the route no longer keep the drone up where an
+    escape left it. People and carts count all the way out.
+  - **Remember what was dodged, all of it.** What an episode is about goes on the planner's map (orange
+    dots), so the re-planned path goes round it. The eye sees only its near side: a round thing (a tree's
+    crown) is mapped as the whole circle that side fits, a flat face as going straight back as deep as
+    it is wide (`eye.footprint`), and more of it as it comes into view on the way round. What the eye
+    sees of walls, beams and other obstacles the map already has is left out, so a wall and something
+    standing near it aren't taken for one big box.
   - **Resume clearance from the eye.** The supervisor's 0.5 m resume clearance is checked on everything
     ahead and to the sides (within 100 degrees of the heading), not only on three rays.
   - **Land with the avoidance on.** The drone keeps deciding (and dodging) down to 0.3 m above the
     landing spot; only the last 0.3 m is the pilot's plain touchdown.
+  - **Turn with the avoidance on.** Before each leg the drone turns to face it, deciding (and dodging)
+    every tick of the turn. Turning blind, a drone hovering in the road while it turned for a re-planned
+    leg was hit by the cart. A flight loop that stops deciding for 2 s writes every thread's stack to
+    the log (the firmware cuts the motors soon after the setpoints stop).
 - **Fly-brain policy (`policies.py` `FlyBrainPolicy`, `eye.py`).** The compound eye's looming, per eye,
   drives the looming detectors of the connectome's escape circuit. The giant fibers' firing rate is the
   avoid signal, and the side whose steering neurons fire more is the side to escape from. The escape
@@ -600,8 +630,8 @@ section 5.
   flights fail. A 1-core CPU flies but has no margin; 2 or more cores is clean.
 - **Brief RTF dips.** On some runs, especially back-to-back ones, the firmware briefly reports ~94-96%
   of real time. Flights still pass; the cause is not yet found.
-- **The planner's map only grows.** It starts from the scene file; after each avoidance episode the
-  static things the compound eye saw nearby are added (orange dots), but nothing is ever removed, so
+- **The planner's map only grows.** It starts from the scene file; what the avoidance meets is added
+  (orange dots; the far side of it guessed from the near side), but nothing is ever removed, so
   something that was moved away stays on the map until the flight ends. Stops are visited in the
   order given, not reordered into a shorter tour. The marker numbers show through obstacles in the 3D view.
 - **One camera client.** The camera bridge serves one client at a time. When a client connects, the

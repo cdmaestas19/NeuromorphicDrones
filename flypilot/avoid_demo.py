@@ -22,6 +22,7 @@ With the sim and the dashboard already running:  bash py.sh avoid_demo.py [--rou
 Ctrl-C lands the drone where it is; a second Ctrl-C cuts the motors.
 """
 import argparse
+import faulthandler
 import json
 import logging
 import math
@@ -36,9 +37,9 @@ import numpy as np
 from avoidance import (CLEAR_OUT_MPS, HORIZONTAL_RAYS, AvoidancePolicy, AvoidanceSupervisor, CostMeter, Mode, Sensors,
                        clear_out, make_sensors)
 from dashboard import DashboardFeed
-from eye import CollisionCourse, EyeSource, clear_below, clear_out_ring, points_near, ring
+from eye import CollisionCourse, EyeSource, clear_below, clear_out_ring, footprint, points_near, ring
 from eye import clearance as eye_clearance
-from flight import Pilot, SafetyStop, fly_mission, setup_logging
+from flight import Pilot, SafetyStop, fly_mission, setup_logging, wrap_deg
 from frames import FrameSource
 from orders import CANCELLED, DELIVERED, SKIPPED, OrderBook, obstacle_gap
 from movers import MoverRunner, load_movers
@@ -58,6 +59,9 @@ DROP_OFF_S = 1.0          # hover at each delivery stop (stands in for releasing
 PASS_M = 0.15             # next path point once this close
 CORNER_MIN_MPS = 0.1      # speed through a turn of 90 degrees or more
 CORNER_SLOWDOWN_PER_S = 0.5  # approaching a corner: speed = corner speed + this x distance
+TURN_DEG = 30.0           # the efference copy (Sensors.route_stop_m) ends at a turn sharper than this: a path round a
+                          # crate turned 0.3 m short of the room's wall, and with the copy ending only at the stop,
+                          # the wall straight ahead loomed: dodge, back on the path, dodge again (mr_blocked, ~10 min)
 FENCE_KEEP_M = 0.1        # the setpoint stays this far inside the geofence (= orders.FENCE_MARGIN_M)
 MAP_TTC_S = 2.5           # never command a time-to-collision below this with a mapped obstacle
                           # (the policy's threat would be 1/2.5 = 0.4, under its 0.5 enter threshold)
@@ -66,7 +70,19 @@ MAP_CORRIDOR_M = 0.25     # ...also along lines this far either side of the path
 DODGE_HALF_WIDTH_M = 0.15  # a dodge slows for what the eye sees within this of its line (drone 0.07 m + margin)...
 DODGE_GAP_M = 0.2          # ...so as to stop this short of it...
 DODGE_TTC_S = 0.8          # ...taking at least this long to get there
-SEEN_RANGE_M = 1.2         # after an episode, static things the eye sees within this go on the planner's map
+SEEN_RANGE_M = 2.5         # after an episode, static things the eye sees within this go on the planner's map: all
+                           # of each, as far as eye.footprint() can tell from the side it sees. (1.2 m and only the
+                           # points within it: the fly brain alarms with a tree crown 1.5-2.5 m off, so after its
+                           # dodge nothing of it was that close, or a sliver of its 2.4 m; the re-planned path ran
+                           # straight back into it, 8-9 dodges in a row; with all it saw, still 3-7)
+GROW_S = 0.5               # and while flying on, at most this often: more of what is on the map as it comes into
+                           # view (going round it), re-planning when the map grows
+SEEN_SHOWN = 600           # the dashboard's top views get about this many of the map's seen points
+TURN_TOL_DEG = 5.0         # a leg starts facing its direction within this (pilot.turn_to's tolerance)...
+TURN_TIMEOUT_S = 6.0       # ...or after this long turning (a 180-degree turn at 90 deg/s takes 2 s)
+STALL_S = 2.0              # no decision for this long: every thread's stack goes to the log (faulthandler). The
+                           # firmware cuts the motors ~2 s after the setpoints stop; a 13 s stall in the flight
+                           # loop dropped a drone onto the road in front of the cart (ac1_cart)
 CLIMB_MPS = 1.0            # up to the route's altitude at most this fast (cruise: 4 m in ~5 s)...
 DESCENT_MPS = 1.0          # ...down at most this fast,
 DESCENT_SLOW_MPS = 0.4     # and this slow lower than SLOW_BELOW_M
@@ -76,6 +92,8 @@ FLOOR_M = 0.1              # (eye.clear_below); anything lower than this is the 
 MIN_Z_M = 0.3              # a dodge never takes the setpoint lower than this...
 CEILING_KEEP_M = 0.4       # ...nor closer than this to the geofence's ceiling
 CEILING_BRAKE_PER_S = 1.5  # a climb slows to this x the room left below that (0.6 m/s 0.4 m short of it)
+ABOVE_RADIUS_M = 0.35      # the same below what is mapped overhead within this of the drone, sideways (planner.
+ABOVE_KEEP_M = 0.25        # room_above: an escape slides ~0.3 m in the time a climb takes to brake), by this
 ALT_TOL_M = 0.05           # at a cruise height or drop-off height once this close
 LAND_HANDOFF_M = MIN_Z_M   # landing: the avoidance stays on down to this height, the pilot's touchdown takes over
 # Careful landing (from cruise height, _come_down): first down to HOLD_M, above people's heads, to look at the
@@ -114,6 +132,23 @@ def _timeout(path: list) -> float:
     return path_length(path) / CRUISE_MPS * 3.0 + MAX_EPISODE_S
 
 
+def _straight_ahead(path: list, i: int, x: float, y: float) -> float:
+    """How far the route takes the drone on straight ahead from (x, y), heading for path[i]: to its end (the
+    stop), or to the first point where it turns by more than TURN_DEG. What stands straight on beyond that
+    isn't in the drone's way: it turns (or stops) first."""
+    d, px, py = 0.0, x, y
+    for k in range(i, len(path)):
+        d += math.hypot(path[k][0] - px, path[k][1] - py)
+        if k == len(path) - 1:
+            return d
+        a1 = math.atan2(path[k][1] - py, path[k][0] - px)
+        a2 = math.atan2(path[k + 1][1] - path[k][1], path[k + 1][0] - path[k][0])
+        if abs((math.degrees(a2 - a1) + 180.0) % 360.0 - 180.0) > TURN_DEG:
+            return d
+        px, py = path[k]
+    return d
+
+
 class AvoidFlight:
     """Flies the stops of an OrderBook on planned paths, handing control to the policy's dodge whenever
     the supervisor says AVOID.
@@ -124,8 +159,9 @@ class AvoidFlight:
     def __init__(self, route_name: str, policy: AvoidancePolicy, camera: FrameSource | None, feed: DashboardFeed,
                  orders: OrderBook, movers: MoverRunner, record: Path | None = None, return_when_done: bool = False,
                  dwell_s: float = DROP_OFF_S, scene: str = 'obstacles', eye: EyeSource | None = None,
-                 cruise_m: float | None = None):
+                 cruise_m: float | None = None, home: bool = True):
         self.route_name, self.scene = route_name, scene
+        self.home = home  # False: land at the last stop (if it was reached) instead of flying home
         self.cruise_z = max(cruise_m or ALTITUDE_M, ALTITUDE_M)  # between stops; stops are flown at ALTITUDE_M
         self.alt_target = ALTITUDE_M                             # the altitude _step holds (outside AVOID)
         self._zone = None                                        # the landing spot a descent watches (_come_down)
@@ -133,6 +169,7 @@ class AvoidFlight:
         self.policy, self.camera, self.feed, self.eye = policy, camera, feed, eye
         self._ring = None  # (azimuth relative to the heading, nearest distance) all round, from the eye
         self._objects, self._objects_reading = CollisionCourse(), None  # the things around, tracked
+        self._grow_t = -math.inf  # when _grow_map last looked
         self._below = math.inf  # how far down the eye sees room (eye.clear_below)
         self.supervisor = AvoidanceSupervisor()
         self.decision_cost, self.telemetry_cost = CostMeter(), CostMeter()
@@ -172,6 +209,7 @@ class AvoidFlight:
             self.phase = f'SAFETY STOP ({"Ctrl-C" if isinstance(e, KeyboardInterrupt) else e}), landing'
             raise
         finally:
+            faulthandler.cancel_dump_traceback_later()  # no more decisions: shutting down isn't a stall
             if self.movers.walks:
                 log.info('%s', self.movers.summary())
             if hasattr(self.policy, 'summary'):
@@ -199,6 +237,7 @@ class AvoidFlight:
         """Fly to each stop as it comes in, on a planned path; with none waiting, hover and wait (or go
         home if asked)."""
         book = self.orders
+        at_stop = False  # down at the last stop (not skipped)
         while True:
             order = book.next()
             if order is None:
@@ -209,6 +248,7 @@ class AvoidFlight:
                 continue
             t_leg = time.monotonic()
             self._set_altitude(self.cruise_z, 'climbing to cruise height')
+            at_stop = False
             if (self._fly_to((order.x, order.y), f'stop {order.n}', give_up=True,
                              stop_if=lambda o=order: o.state == CANCELLED)
                     and self._come_down((order.x, order.y), f'stop {order.n}') is not None):
@@ -216,8 +256,12 @@ class AvoidFlight:
                 book.finish(order, DELIVERED)
                 self.phase = f'stop {order.n}: dropping off'
                 self._hover(self.dwell_s)
+                at_stop = True
             else:
                 book.finish(order, SKIPPED)  # no-op if it was cancelled
+        if at_stop and not self.home:
+            log.info('landing at the last stop')
+            return
         self._set_altitude(self.cruise_z, 'climbing to cruise height')
         self._fly_to(book.home, 'home')
         self._come_down(book.home, 'home')
@@ -366,8 +410,7 @@ class AvoidFlight:
         st = pilot.tm.state()
         dx, dy = path[1][0] - st.x, path[1][1] - st.y
         if math.hypot(dx, dy) > 0.2:
-            self.phase = f'turning toward {name}'
-            pilot.turn_to(math.degrees(math.atan2(dy, dx)))
+            self._turn_to(math.degrees(math.atan2(dy, dx)), name)
         self.phase = f'flying to {name}'
         t_end = time.monotonic() + _timeout(path)
         map_version = book.map_version
@@ -395,7 +438,7 @@ class AvoidFlight:
                 k = min(CRUISE_MPS, speed) / dist if dist > 1e-6 else 0.0
                 v_route = self._map_safe(st, (dx * k, dy * k, 0.0))
 
-                s = self._decide(st, v_route, dist if final else math.inf)
+                s = self._decide(st, v_route, _straight_ahead(path, i, st.x, st.y))
                 if self.supervisor.mode is Mode.AVOID:
                     self._dodge(s)
                     continue
@@ -431,21 +474,28 @@ class AvoidFlight:
 
     def _decide(self, st, v_route: tuple, stop_m: float = 0.0) -> Sensors:
         """One decision: sensors -> policy -> supervisor. Everything in here is what CostMeter times.
-        stop_m: how far ahead the route will stop the drone (0: holding position; inf: flying on)."""
+        stop_m: how far the route takes the drone on straight ahead: to its stop, or to where it turns
+        (_straight_ahead; 0: holding position; inf: flying on)."""
         t_decide = time.perf_counter_ns()
+        faulthandler.dump_traceback_later(STALL_S)  # re-armed every decision: only a stalled loop fires it
         planner = self.orders.planner
         s = make_sensors(time.monotonic(), (st.x, st.y, st.z), st.yaw, (st.vx, st.vy, st.vz), v_route,
                          st.ranges, self.supervisor.mode, self.eye.latest() if self.eye else None, stop_m,
-                         planner.route_cost if planner.field_goal is not None else None)
+                         planner.route_cost if planner.field_goal is not None else None,
+                         lambda x, y: not planner.free(x, y), self._scene_mapped)
         frame = self.camera.latest() if self.camera else None
         self.cmd = self.policy.step(s, frame)
         if s.eye is not None and s.eye is not self._objects_reading:  # what is around, static or moving
             self._objects_reading = s.eye
-            self._objects.update(s.eye)
+            self._objects.update(s.eye, mapped=self._scene_mapped)
+            if self.supervisor.mode is Mode.NOMINAL:
+                self._grow_map(s)
+            else:
+                self._map_threats(s)
         if s.eye is not None:  # the nearest thing ahead and aside, not just on three rays; and the room below
             self._ring = ring(s.eye, s.yaw_deg)
             self.clearance = eye_clearance(*self._ring)
-            self._below = clear_below(s.eye)
+            self._below = clear_below(s.eye, self._known_below)
         else:
             self._ring, self._below = None, math.inf
             self.clearance = min(s.ranges['front'], s.ranges['left'], s.ranges['right'])
@@ -484,7 +534,7 @@ class AvoidFlight:
             if closing <= 0.05:
                 continue
             reach = closing * MAP_TTC_S
-            d = planner.distance_ahead(st.x - uy * off, st.y + ux * off, ux, uy, reach)
+            d = planner.distance_ahead(st.x - uy * off, st.y + ux * off, ux, uy, reach, st.z)
             if d < reach:
                 scale = min(scale, d / reach)
         return (v[0] * scale, v[1] * scale, v[2])
@@ -544,6 +594,8 @@ class AvoidFlight:
         # overshoot it by 0.5 m, through the geofence (fs_blocked, back-to-back escape climbs)
         z_top = z1 - CEILING_KEEP_M
         z_now = self.pilot.tm.state().z
+        # ...and below anything mapped overhead near the drone (a beam): as for the ceiling
+        z_top = min(z_top, z_now + self.orders.planner.room_above(sp[0], sp[1], z_now, ABOVE_RADIUS_M) - ABOVE_KEEP_M)
         vz = min(vz, max(CEILING_BRAKE_PER_S * (z_top - sp[2]), 0.0), max(CEILING_BRAKE_PER_S * (z_top - z_now), 0.0)) \
             if vz > 0.0 else vz
         vz = max((MIN_Z_M - sp[2]) / dt, min((z_top - sp[2]) / dt, vz))
@@ -560,15 +612,33 @@ class AvoidFlight:
             else:
                 self._step((0.0, 0.0, 0.0), None)  # holds position, and the route's altitude
 
+    def _turn_to(self, yaw_deg: float, name: str):
+        """Turn in place to face the next leg, with the avoidance on (pilot.turn_to turned blind: in
+        ac1_cart the drone turned for its re-planned leg while hovering in the cart's lane, the cart ran into
+        it, and the turn waited out its timeout with the drone on the road). A dodge ends the turn: the leg
+        flies on from wherever the dodge leaves the drone, as after any dodge."""
+        self.phase = f'turning toward {name}'
+        t_end = time.monotonic() + TURN_TIMEOUT_S
+        while time.monotonic() < t_end:
+            st = self.pilot.tm.state()
+            s = self._decide(st, (0.0, 0.0, 0.0))
+            if self.supervisor.mode is Mode.AVOID:
+                self._dodge(s)
+                return
+            if abs(wrap_deg(yaw_deg - st.yaw)) < TURN_TOL_DEG and abs(wrap_deg(yaw_deg - self.pilot.setpoint[3])) < 1e-3:
+                return
+            self._step((0.0, 0.0, 0.0), yaw_deg)  # turns at the pilot's yaw rate; holds position and altitude
+        log.warning('%s: not facing %.0f deg after %.0f s; flying on', name, yaw_deg, TURN_TIMEOUT_S)
+
     def _on_mode_change(self, s: Sensors):
         sup, info = self.supervisor, self.cmd.info
         if sup.mode is Mode.AVOID:
             if self.policy.brake_on_avoid:
                 self.pilot.hold_position()  # stop here instead of finishing the setpoint's lead
-            if 'gf_left' in info:  # the fly brain: its giant fibers and what the eyes saw
-                log.info('AVOID   episode %d: signal %.2f >= %.2f (giant fibers L %.0f R %.0f Hz; eye drive L %.2f R %.2f)',
-                         sup.episodes, self.cmd.signal, sup.enter, info['gf_left'], info['gf_right'],
-                         info['drive_left'], info['drive_right'])
+            if 'gf_left' in info:  # the fly brain (or the looming model): its alarm rates and what the eyes saw
+                log.info('AVOID   episode %d: signal %.2f >= %.2f (%s L %.0f R %.0f Hz; eye drive L %.2f R %.2f)',
+                         sup.episodes, self.cmd.signal, sup.enter, getattr(self.policy, 'alarm_label', 'giant fibers'),
+                         info['gf_left'], info['gf_right'], info['drive_left'], info['drive_right'])
             else:
                 ray = info.get('worst_ray', '?')
                 log.info('AVOID   episode %d: signal %.2f >= %.2f (%s ray %.2f m, TTC %.1f s)',
@@ -582,17 +652,76 @@ class AvoidFlight:
 
     def _map_what_was_dodged(self, s: Sensors):
         """After an avoidance episode, put the static things the eye sees nearby that aren't on the map yet on
-        the planner's map, so the re-planned path goes round them instead of straight back into them. Only
-        things never seen moving: a person or a cart moves on, a crate stays."""
+        the planner's map, all of each (eye.footprint: the far side too), so the re-planned path goes round
+        them instead of straight back into them. Only things never seen moving: a person or a cart moves on,
+        a crate stays."""
         if self._objects_reading is None:
             return
-        planner = self.orders.planner
         x, y = s.position[0], s.position[1]
-        points = [p for obj in self._objects.objects if not obj.moved for p in obj.points
-                  if math.hypot(p[0] - x, p[1] - y) < SEEN_RANGE_M and planner.free(p[0], p[1])]
-        if points and planner.add_seen(points):
-            log.info('map: added an obstacle the avoidance met (%d points within %.1f m; not on the "%s" map)',
-                     len(points), SEEN_RANGE_M, planner.map_name)
+        met = [obj for obj in self._objects.objects if not obj.moved and len(obj.points)
+               and np.hypot(obj.points[:, 0] - x, obj.points[:, 1] - y).min() < SEEN_RANGE_M]
+        added = self._add_to_map(met, s)
+        if added:
+            log.info('map: added %d obstacle(s) the avoidance met (%d points: what the eye saw of them within '
+                     '%.1f m, and their far side; not on the "%s" map)', len(met), added, SEEN_RANGE_M,
+                     self.orders.planner.map_name)
+
+    def _map_threats(self, s: Sensors):
+        """During an episode: what it is about goes on the map, all of it (eye.footprint): the static things
+        on a collision course with the drone. After the dodge it may be further off than SEEN_RANGE_M (an
+        escape backs away from what is ahead): then _map_what_was_dodged no longer counts it, and the
+        drone flew back into a tree crown nine times."""
+        if s.t < self._grow_t + GROW_S:
+            return
+        self._grow_t = s.t
+        threats = [obj for obj in self._objects.objects if not obj.moved and obj.weight > 0.0 and len(obj.points)]
+        added = self._add_to_map(threats, s)
+        if added:
+            log.info('map: added what the avoidance is dodging (%d points: what the eye sees of it and its far '
+                     'side; not on the "%s" map)', added, self.orders.planner.map_name)
+
+    def _grow_map(self, s: Sensors):
+        """While flying on: more of what the avoidance put on the map, as it comes into view (the eye sees
+        the far side of a tree while going round it). The flight re-plans when the map grows (map_version)."""
+        planner = self.orders.planner
+        if not planner.seen_points or s.t < self._grow_t + GROW_S:
+            return
+        self._grow_t = s.t
+        known = [obj for obj in self._objects.objects if not obj.moved and len(obj.points)
+                 and planner.seen_at(obj.points)]
+        added = self._add_to_map(known, s)
+        if added:
+            log.info('map: %d more points of what is on it, as it came into view', added)
+
+    def _add_to_map(self, objects: list, s: Sensors) -> int:
+        """The objects' footprints on the planner's map (what isn't there yet); the flight re-plans. Not
+        what may be a mover that paused (eye.CollisionCourse.near_movers), nor what moves right now. Of each,
+        only what isn't a mapped obstacle already (planner.mapped_at, at the height the eye saw it): the eye
+        joined a wall and the cart's side into one corner, mirrored across the courtyard (fb_wallside), and a
+        beam 1.5 m up, seen by a drone an escape had left high, went on the 0.5 m map below it (fb_blocked:
+        no path home; seen from 1.15 m, the ring's upward rows, fc_blocked)."""
+        planner = self.orders.planner
+        objects = [obj for obj in objects if obj.velocity == (0.0, 0.0) and not self._objects.near_movers(obj.points)]
+        points = []
+        for obj in objects:
+            p = np.asarray(obj.points, float)
+            z = obj.z if obj.z is not None else np.full(len(p), s.position[2])
+            p = p[~planner.mapped_at(np.column_stack([p[:, :2], z]), seen=False)]
+            points += list(footprint(p, s.position))
+        added = planner.add_seen(points) if points else 0
+        if added:
+            self.orders.map_version += 1
+        return added
+
+    def _scene_mapped(self, pts: np.ndarray) -> np.ndarray:
+        """Sensors.mapped: which eye hits are on the scene's mapped obstacles (they stand still)."""
+        return self.orders.planner.mapped_at(pts, seen=False)
+
+    def _known_below(self, pts: np.ndarray) -> np.ndarray:
+        """For the descent's look below (eye.clear_below): which hits are on what the map has (planned paths
+        keep their distance from it), and not where a mover was lately (a person under a mapped tree crown:
+        what add_seen mapped has no height)."""
+        return self.orders.planner.mapped_at(pts) & ~self._objects.where_movers(pts)
 
     def _write_record(self, s: Sensors, v_route_world: tuple):
         """One JSON line per decision: the raw inputs and the decision taken (replayed by bench.py), plus, for
@@ -644,7 +773,8 @@ class AvoidFlight:
             'ranges': st.ranges, 'decision_cost': self._cost_summary,
             'eye_ring': None if self._ring is None else  # what is around the drone: [world azimuth deg, m]
             [[round(float(a) + st.yaw, 1), round(float(d), 2)] for a, d in zip(*self._ring) if d < 4.0],
-            'seen': [[round(x, 2), round(y, 2)] for x, y in self.orders.planner.seen_points[-300:]],
+            'seen': [[round(x, 2), round(y, 2)] for x, y in  # all of it, thinned (the newest 300 left a crown out)
+                     self.orders.planner.seen_points[::len(self.orders.planner.seen_points) // SEEN_SHOWN + 1]],
             'orders': self.orders.snapshot(), 'scene': self.scene, 'movers': self.movers.snapshot(),
         })
 
@@ -668,7 +798,7 @@ def _join_at(argv: list) -> list:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--route', choices=sorted(ROUTES) + ['live'], default='blocked',
-                    help='a test route from routes.py (its stops and map; ends at home), or "live": '
+                    help='a test route from routes.py (its stops and map; ends at home, or at its last stop), or "live": '
                          'no stops until you add them, and it waits for more')
     ap.add_argument('--at', type=xy, action='append', default=[], metavar='X,Y',
                     help="an extra stop in metres, after the route's; repeat for more")
@@ -676,7 +806,8 @@ def main() -> int:
                     help='(live) return home and land after the last stop instead of waiting for more')
     ap.add_argument('--map', choices=MAPS, default=None,
                     help="what the path planner knows, instead of the route's (live: all; planner.py "
-                         "explains): all, building (crates left to the avoidance), none (straight lines)")
+                         "explains): all, building (crates left to the avoidance), notrees (and the trees), "
+                         "none (straight lines)")
     ap.add_argument('--scene', choices=sorted(SCENES), default=None,
                     help="(live) the scene, with what moves in it (routes.LIVE_MOVERS); a route brings its own. "
                          "launch.cmd starts the sim on the same scene")
@@ -711,7 +842,7 @@ def main() -> int:
     if getattr(policy, 'brain_ok', True) is False:
         orders.close()
         raise SystemExit('the fly brain is not answering on udp://127.0.0.1:5320; launch.cmd starts it for '
-                         '--policy flybrain (or: bash ../flybrain/py.sh brain_server.py)')
+                         '--policy flybrain / flybrain-rf (or: bash ../flybrain/py.sh brain_server.py)')
     log.info('avoidance test: route "%s" in the "%s" scene on the "%s" map, policy "%s" (reads: %s)%s%s',
              args.route, scene, orders.planner.map_name, policy.name, ', '.join(policy.inputs) or 'nothing',
              f'; moving: {", ".join(w.mover for w in movers.walks)}' if movers.walks else '',
@@ -746,10 +877,12 @@ def main() -> int:
 
     flight = AvoidFlight(args.route, policy, camera, DashboardFeed(), orders, movers, args.record,
                          return_when_done=args.return_when_done or route is not None,
-                         dwell_s=route.dwell_s if route else DROP_OFF_S, scene=scene, eye=eye, cruise_m=cruise)
+                         dwell_s=route.dwell_s if route else DROP_OFF_S, scene=scene, eye=eye, cruise_m=cruise,
+                         home=route.home if route else True)
     try:
         code = fly_mission(flight.run, geofence=fence)
     finally:
+        faulthandler.cancel_dump_traceback_later()  # the flight is over: no more decisions
         if camera:
             camera.close()
         if eye:

@@ -7,7 +7,7 @@ the brain plugs into it as one avoidance policy (`--policy flybrain`) next to th
 ```
 compound eye (sim) --> looming per eye --> LC4 + LPLC2 looming detectors (Poisson input, per eye)
      360 degrees           eye.py                      |
-                                         escape subcircuit of FlyWire 783 (3,118 LIF neurons)
+                                escape circuit of FlyWire 783 (1,656 LIF neurons, pruned by activity)
                                                        |
                          giant fibers DNp01 (when)  +  steering DNs DNp02/04/06/11 (which side)
                                                        |
@@ -18,9 +18,11 @@ compound eye (sim) --> looming per eye --> LC4 + LPLC2 looming detectors (Poisso
   634:210), unchanged: the same equations and parameters (`model.py` of
   [Drosophila_brain_model](https://github.com/sazulai/Drosophila_brain_model)). Each connection's
   weight is its signed synapse count from the FlyWire connectome.
-- **The circuit** is cut out of the whole brain. It keeps every neuron on a path of at most 3 synapses
-  from the looming detectors (LC4, LPLC2) to the escape outputs, through connections of at least 5
-  synapses. There are 37 outputs: the two giant fibers (DNp01, the fly's escape command) and the 35
+- **The circuit** is the part of the whole brain that fires when it sees looming: the whole brain was
+  run on 240 looming tests and every neuron that spiked was kept (check 3 below; 1,656 neurons). Until
+  2026-10-26 it was cut out by wiring instead: every neuron on a path of at most 3 synapses from the
+  looming detectors (LC4, LPLC2) to the escape outputs, through connections of at least 5 synapses
+  (3,118 neurons; `brain_server.py --circuit h3`). There are 37 outputs: the two giant fibers (DNp01, the fly's escape command) and the 35
   other descending neurons that get at least 20 synapses straight from the looming detectors.
 - **The eye** is an ideal one: the simulator measures the distance to the scenery every 5 degrees all
   the way round, from straight down to 30 degrees up. Looming is how fast that distance shrinks
@@ -30,6 +32,21 @@ compound eye (sim) --> looming per eye --> LC4 + LPLC2 looming detectors (Poisso
 - **The brain runs in its own process** (`brain_server.py`), in step with the flight's 20 Hz loop,
   with its own Python environment. Brian2 and PyTorch don't mix in one process, and the flight
   stack's numpy is 2.x.
+
+There are three versions of the brain's input and readout, each a policy of its own:
+
+| Policy | Input to LC4 / LPLC2 | Readout | Senses |
+|---|---|---|---|
+| `flybrain` | two channels: every neuron of an eye at that eye's looming | giant fibers (when), steering DNs (side) | the 360-degree eye |
+| `flybrain-rf` | each neuron its own receptive field, from the connectome (`retinotopy.py`) | giant fibers (when), a **trained readout** of all 37 outputs (where the threat is: side and front/back) | the 360-degree eye |
+| `flybrain-cam` (experimental) | the same receptive fields, on looming from the **AI-deck camera** (`flypilot/camera_loom.py`) | the same | camera ahead; Multi-ranger beside, behind, and as a safety net ahead |
+
+```
+camera (or 360 eye) --> looming per direction --> each LC4/LPLC2 its own receptive field --> escape circuit
+                                                                                               |
+                         controller <-- escape away from it <-- trained readout: where <-- 37 outputs
+                                                            giant fibers: when <------------'
+```
 
 ## Running it
 
@@ -42,11 +59,15 @@ flypilot\launch.cmd avoid --route hover --policy flybrain     a person walks up 
 flypilot\launch.cmd avoid --route headon --policy flybrain    (also crossing, cart, dropoff, square, blocked)
 flypilot\launch.cmd deliver --scene street --policy flybrain  live stops among people and a cart; it cruises
                                                               at 4.5 m and comes down carefully at each stop
+flypilot\launch.cmd avoid --route showcase --policy flybrain-rf   receptive fields and the trained readout
+flypilot\launch.cmd avoid --route blocked --policy flybrain-cam   on the camera (experimental)
 flypilot\brain_reproduce.cmd                                  check the model against published results
 flypilot\brain_validate.cmd                                   check the cut-out circuit against the whole brain
 ```
 
-`launch.cmd` starts the brain server for `--policy flybrain` (its log is `flypilot\logs\brain.log`).
+`launch.cmd` starts the brain server for any of the three (its log is `flypilot\logs\brain.log`).
+After changing the receptive fields or the brain's input, retrain the readout:
+`bash py.sh train_readout.py` (~5 min; `--calibrate` and `--equalize` redo the gains, see below).
 The dashboard's pipeline shows the compound eye's looming per eye and the giant fibers' rates. At the
 end of each flight the terminal prints what the eyes and the giant fibers did, the number of escape
 bursts, and the brain's compute time per tick.
@@ -74,14 +95,42 @@ is larger.
 | Circuit (FlyWire 783) | Neurons | Giant-fiber rates matched (of 8) | Speed |
 |---|---|---|---|
 | 2 synapses deep, connections >= 5 synapses | 566 | no: misses inhibition; the opposite side's giant fiber fires up to 2.5x too much | |
-| **3 deep, >= 5 (flown)** | **3,118** | close; one opposite-side rate off | **Brian2: ~5 ms per 50 ms tick idle, 17 ms on average in flight. C engine: 1.6-4 ms, 2.0 ms on average in flight** |
+| 3 deep, >= 5 (flown until 2026-10-26) | 3,118 | close; one opposite-side rate off | **Brian2: ~5 ms per 50 ms tick idle, 17 ms on average in flight. C engine: 1.6-4 ms, 2.0 ms on average in flight** |
 | 4 deep, >= 10 | 4,854 | close; one opposite-side rate off | |
 | 4 deep, >= 5 | 18,326 | all 8 | Brian2: 33-69 ms per tick next to the simulator, too slow to fly. C engine: 9 ms quiet, ~30 ms with looming |
 
-The drone flies the 3-deep circuit. It was the largest one that kept up with real time next to the
-simulator in Brian2, and its giant fibers respond to looming practically as the fully validated 4-deep
+Until the pruned circuit (check 3), the drone flew the 3-deep circuit. It was the largest one that kept
+up with real time next to the simulator in Brian2, and its giant fibers respond to looming practically as the fully validated 4-deep
 circuit's do (table below), so the cut costs little where it matters. With the C engine the 4-deep
 circuit fits in the 50 ms tick too (`brain_server.py --hops 4`), with less room to spare on a laptop.
+
+**3. Pruned by activity: run the whole brain, keep what fires** (`flypilot\brain_prune.cmd`, `prune.py`;
+suggested in review). In this model a neuron acts on others only when it spikes: no background
+activity, nothing below threshold reaches another neuron. So a neuron that never spikes during a test can
+be removed without changing that test at all; the only question is whether the tests cover what the
+drone meets. `prune.py` runs the whole brain (in C, below) on 120 training tests, 2 seeds each: spheres
+approaching from every 30 degrees, two elevations, two sizes and speeds, and 12 recorded flights replayed
+through the eye, with both kinds of input. **1,654 neurons spiked; with every input and output, the
+pruned circuit has 1,656 neurons and 131k connections** (`active_783.txt`, in git; setup builds the
+circuit from it). Of the flown 3-hop cut's 3,118 neurons, 2,181 never fired, and 717 neurons outside it
+did (among them the descending neurons DNge119 and DNge053). On 6 training tests the pruned circuit's
+every neuron spikes exactly as in the whole brain, as it must. Then 44 **held-out tests** it was never
+chosen on (spheres from the directions in between, larger and faster ones than any it trained on,
+12 other flights), every circuit against the whole brain on the same input spikes:
+
+| Circuit | Neurons | Held-out runs identical to the whole brain | Alarms missed / extra | Outputs off (90th percentile) |
+|---|---|---|---|---|
+| **pruned by activity** | **1,656** | **82 of 88** | **0 / 0** | **0%** |
+| 3 deep (flown until now) | 3,118 | 4 of 88 | 6 / 6 | 16-41% |
+| 4 deep | 18,326 | 4 of 88 | 2 / 1 | 12-21% |
+
+It is half the size of the 3-deep cut and more faithful than a cut eleven times its size. Spike for
+spike it runs the same in C as in Brian2 (`check_fast.py --circuit active`), at 2.1 ms per 50 ms tick
+against the 3-deep cut's 3.8 (1.0-1.8 ms in flight). Its giant fibers alarm as early from every side as
+the 3-deep cut's with the same input gains (within 0.1 s), and its trained readout is as good (7 degrees
+median bearing error, 98% left/right, on the same 80 flights). `brain_server.py --circuit active|h3|h4`
+picks the circuit; each has its own readout (`flypilot/models/brain_readout_<circuit>.npz`), and the
+policy loads the one the server names.
 
 **The C engine** (`fastlif.c`, the flight's default; `brain_server.py --engine brian2` runs Brian2).
 Brian2 steps the network from Python, and at 250 steps per 50 ms tick its per-step overhead, not the
@@ -99,6 +148,19 @@ arithmetic), which would be a port, not a recompile.
 Its giant-fiber response to looming is practically the same as the fully validated 4-deep circuit's
 (table below), so the cut costs little where it matters.
 
+**The whole brain on a CPU core** (suggested in review: a fast CPU rather than a GPU). The same kernel
+runs all 138,639 neurons and 15.1M connections (`circuit.whole_circuit`). Against the model repo's own
+Brian2 runs of the four looming experiments (10 trials each), 99.3-100% of the neurons that fire match in
+rate (correlation 0.999) and all 8 giant-fiber rates match (`prune.py check`). For a big network the
+kernel steps only the neurons not at rest (`lif_run_sparse`: a neuron at rest is a fixed point of the
+update; spikes are taken in index order, so the result is bit for bit the dense loop's): 3.1x faster on
+the whole brain, ~0.9 s per simulated second on one core during a looming test (a GPU has little to do
+when ~1% of the neurons are busy). Peaks reach ~95 ms per 50 ms tick, so the whole brain could not yet fly
+next to the simulator; it can run hundreds of tests: 240 whole-brain runs took 5 minutes, ~1 GB each where
+a Brian2 run takes 4.3 GB. Brian2GeNN (Brian2 on a GPU through GeNN) was the other suggestion; GeNN is
+built for single long runs, not a step every 50 ms, and it would need the CUDA toolkit installed in WSL.
+With the CPU numbers above it isn't needed.
+
 In flight the brain integrates in 0.2 ms steps instead of the model's 0.1 ms (`brain_server.py
 --dt-ms`). The model's equations are linear and integrated exactly, so the step mostly sets how finely
 spike times are resolved. Measured over the table below, the giant fibers' rates at 0.2 ms match those
@@ -111,7 +173,9 @@ Each 50 ms tick:
 1. **Eye.** `eye.Looming` turns two successive compound-eye readings into looming per ommatidium.
    `eye.CollisionCourse` keeps only what is on a collision course. It groups the directions into objects
    (neighbouring directions at similar distances) and tracks each one's motion; people and carts are
-   fast enough to measure, and anything slower than 0.5 m/s counts as standing still. An object counts
+   fast enough to measure, and anything slower than 0.5 m/s counts as standing still, as does anything
+   mostly on the scene's map (a wall's visible stretch slides as the drone passes, which looked like
+   motion). An object counts
    if, on the current relative motion, any of its points will pass within 0.15 m of the drone, and not
    at all beyond 0.3 m (the planner's clearance). An approaching person counts, and so does a wall the
    drone flies at, but a crate it flies past does not. Each eye's drive is its most looming 30-degree
@@ -164,11 +228,13 @@ The flight adds the same safety rules around every policy, the fly brain include
 - **No dodging into things.** A dodge slows down rather than fly into what the eye sees in its path.
 - **Down only when clear below.** After a climb, the drone returns to its route altitude (up to 1 m/s,
   0.4 m/s near the ground), and only while the eye's downward-looking rows see room below it: never
-  onto a person or a cart.
-- **Remember what was dodged.** After each avoidance episode, the static things the eye sees within
-  1.2 m that aren't on the planner's map go on it (shown as orange dots on the top views), so the
-  re-planned path goes round an unmapped crate instead of straight back into it. Only things never
-  seen moving are added: a person or a cart moves on.
+  onto a person or a cart. What is on the map counts only right under it (a crate beside it doesn't).
+- **Remember what was dodged, all of it.** What an avoidance episode is about goes on the planner's map
+  (orange dots on the top views), so the re-planned path goes round it instead of straight back into it.
+  The eye sees only the near side, so the rest is filled in (`eye.footprint`): a round thing (a tree's
+  crown) becomes the whole circle that side fits, a flat face is taken to go straight back as deep as it is wide.
+  Going round it, more of it goes on the map as it comes into view, and the path is planned again. Only
+  things never seen moving are added (a person or a cart moves on), and nothing the map already has.
 - **Land with the avoidance on.** The avoidance keeps deciding down to 0.3 m above the landing spot,
   so someone walking onto it is dodged. Only the last 0.3 m is the pilot's plain touchdown.
 
@@ -243,6 +309,174 @@ Read this with care:
 - **The direction is mostly not the brain's.** The fly circuit's clear contribution here is the
   timing of the escape. The side came from the brain in 18% of the episodes.
 
+### Against a looming model without the connectome
+
+The abstract looming model arm (`--policy looming`, `flypilot/policies.py` `LoomingModelPolicy`) is the
+fly-brain policy with the brain taken out: the same eye, collision-course selectivity, escapes, map,
+person / vehicle rules, one-tick delay and smoothing. Its alarm is a threshold on the brain's own input,
+the two eyes' summed looming drive. Calibrated to the brain's head-on alarm point (summed drive 0.13),
+flown on every route twice (2026-10-24), closest approach to the person or cart:
+
+| Route | Fly brain | Looming model (0.13) |
+|---|---|---|
+| `hover` | 0.16 / 0.21 m | 0.19 / 0.21 m |
+| `headon` | 0.20 / 0.21 m | 0.33 / 0.26 m |
+| `crossing` | 0.42 / 0.44 m | 0.46 / 0.34 m |
+| `cart` | 0.29 / 0.18 m | 0.30 / 0.11 m |
+| `lane` | 0.34 / 0.31 m | 0.10 / 0.11 m |
+| `dropoff` | 0.12 / 0.23 m | 0.22 / 0.21 m |
+
+Neither had a contact or a false alarm (`square`), and both delivered every static route. The brain did
+better in `lane`: it raised the alarm with the cart 2.3-2.6 m away, the model at 1.9-2.0 m. That is the
+connectome's sensitive right-eye pathway (the cart comes from the drone's right). But replaying the
+brain's flights through the model at other thresholds shows the same can be had without the wiring:
+
+| Model threshold | Alarm vs the brain's (median) | Brain episodes missed (of ~55) | Alarms the brain didn't raise | On `square` |
+|---|---|---|---|---|
+| 0.13 | 0.20 s later | 14 | 16 | 0 |
+| 0.10 | the same | 1 | 12 | 0 |
+| 0.08 | 0.10 s earlier | 0 | 10 | 0 |
+
+So far, a plain looming threshold tuned to be as sensitive does what the connectome does here. The
+brain's edge in `lane` is its sensitivity, which a threshold can match, not a computation the threshold
+lacks. (Open loop, on the brain's flights: to be confirmed by flying the model at 0.10, and by more
+runs per route.) A negative result for the research question, and a useful one.
+
+### Where is the threat? Each looming detector with its own receptive field (open loop)
+
+In flight every LC4/LPLC2 neuron of an eye gets the same input, so the brain can't know where a threat
+is. `retinotopy.py` gives each of the 314 its own receptive field, from the wiring alone:
+1. **Columns.** The eye's ~780 columns are placed by their Mi1 cells' positions, flattened.
+2. **Columnar neurons.** Their positions are spread over the synapses of 33 columnar cell types, ~24,500
+   neurons per eye.
+3. **Receptive fields.** Each LC4/LPLC2 field is centred where its own inputs come from.
+
+The map is oriented by the cells' physical axes and by the VS cells' known front-to-back order:
+- The front-to-back sign, found independently for each eye, comes out the same in both.
+- HSN/HSE/HSS land dorsal/equatorial/ventral in the left eye. In the right eye, HSN lands just below HSE.
+- Each eye's fields tile its own side, from 0 to ~155 degrees (`results/retinotopy.png`).
+
+`directions.py` then sends looming from 24 directions (a 0.25 m sphere at 1.5 m/s) through the escape
+circuit and decodes the descending neurons. The decoder is a linear readout, cross-validated by trial
+(2026-10-25, 8 trials per direction):
+
+| Input | Left/right | Front/back | Azimuth error | Unseen direction | Up/down |
+|---|---|---|---|---|---|
+| two channels (as flown) | 89% | 66% | 29 deg | 45 deg | 100% |
+| each neuron its own field | 100% | 100% | 3 deg | 7 deg | 100% |
+| fields shuffled among each eye's neurons | 100% | 100% | 5 deg | 10 deg | 90% |
+
+- **With its own receptive fields, the circuit's descending neurons carry where the threat is.** A small
+  trained readout recovers it to a few degrees, including directions it was never trained on. Today's
+  two channels can't give front/back, which is why the eye supplies it in flight.
+- **But a shuffled map does almost as well.** What matters is that each neuron sees its own patch, not
+  much which patch. The connectome's own map is only slightly better (3 vs 5 deg; up/down 100% vs 90%;
+  one shuffle, not yet tested for significance).
+- **Timing.** The input gain was calibrated so a head-on threat alarms the giant fibers about as early
+  as with two channels (1.57 vs 1.65 s before contact, gain 128). The brain then prefers the front:
+  - Lateral and rear threats alarm later (0.45-1.35 s).
+  - Threats 20 degrees below alarm earlier than in flight (1.0-1.55 s vs 0.60 s). The flight's eye leaves
+    out rows below -10 degrees.
+  - The left eye is less sensitive here too.
+
+### Flying it: receptive fields and a trained readout (`--policy flybrain-rf`)
+
+The eye sends its looming per ommatidium (`eye.Looming.loom_points`). The brain server drives each
+LC4/LPLC2 neuron with the looming inside its own receptive field (`brain_server.Inputs`). A small trained
+readout turns the 37 output neurons' rates into where the threat is (`train_readout.py`:
+linear, ridge regression, `flypilot/models/brain_readout_<circuit>.npz`). The escape for a standing threat goes away
+from it, as a fly's takeoff goes away from the looming: sideways to the far side, and forward or back. The
+giant fibers still decide when.
+
+**Two changes to the fly's eye for a drone.** The first flight of this version (2026-10-25) touched a person
+twice: in `hover` (someone walks up from behind) and in `crossing` (from the side). The giant fibers
+alarmed late, and both reasons are biology:
+- **No blind spot behind.** The fly's fields reach ~155 degrees round each side and leave ~50 degrees blind
+  behind. `RF_STRETCH` spreads them over all 180 degrees.
+- **The same warning from every side.** The circuit answers the front first: a sphere from the side alarmed
+  the giant fibers 0.4-0.8 s before contact, head-on 1.1 s. `RF_PROFILE` boosts each eye's input by
+  azimuth so that a threat from any side alarms as early as head-on. `train_readout.py --equalize` finds
+  the boost, up to x9.4 on the left at 90 degrees and x2.9 on the right, which is the left/right asymmetry
+  again.
+
+The head-on gain `RF_GAIN` was then set on 80 recorded flights against the two-channel brain
+(`--calibrate`):
+- **Timing:** alarms 0.15 s earlier (median).
+- **Agreement:** 8% of its alarms are missed, the same as two runs of the two-channel brain differ from each
+  other.
+- **False alarms:** none on `square`.
+
+**The readout**, on flights it was not trained on, at alarm level (4,818 ticks):
+
+| | Trained readout | The two-channel brain's steering neurons |
+|---|---|---|
+| Bearing error | median 6 deg, 90% within 19 deg | - |
+| Threat on the left or right | 100% | 75% |
+| Threat ahead or behind | 97% | cannot tell |
+
+**Flown on every route** (2026-10-25, after the changes; closest approach to the person or cart):
+
+| Route | `flybrain` | `flybrain-rf` |
+|---|---|---|
+| `showcase` | 0.36 m | 0.36 m |
+| `hover` | 0.25 m | 0.17 m |
+| `headon` | 0.21 m | 0.31 m |
+| `crossing` | 0.47 m | 0.51 m |
+| `cart` | 0.22 m | 0.29 m |
+| `lane` | 0.29 m | 0.35 m |
+| `dropoff` | 0.15 m | 0.23 m |
+
+Both delivered every stop of all 12 routes, with no contact and no false alarm on `square`.
+
+**Which way: what the brain now decides.**
+- **Front or back:** the readout decides it for every standing threat. Before, only the eye could.
+- **The side:** the counts barely moved: brain 11, eye 22, map 5 (two channels: 10, 22, 4, plus 1 by
+  motion). Most episodes are people and the cart. Getting out of a mover's path needs where it is heading,
+  and one look at the looming doesn't carry that, so the eye's tracker still supplies it.
+- **Next:** the readout's bearing changing over time does carry where a mover is heading.
+
+### On the camera (`--policy flybrain-cam`, experimental)
+
+This is the whole pipeline on what a real Crazyflie carries: AI-deck camera -> looming -> the same
+receptive fields, circuit and trained readout. The Multi-ranger covers beside and behind with the
+geometric time-to-collision rule, and is a safety net ahead at half weight. It never reads the 360-degree
+eye.
+
+**Looming from the camera images is the weak link** (`flypilot/camera_loom.py`).
+- **What failed:** motion-detector versions, with dense optic flow standing in for T4/T5. Neither four-arm
+  LPLC2 units nor a shift + turn + expansion fit per field could tell looming from noise at the recorded
+  half resolution (162 x 122). A person 2 m off grows by ~0.5 pixel per frame, under the image's shift from
+  the drone's own motion, and the simulator's plain surfaces carry no motion inside them.
+- **What works best so far:** objects as image regions bounded by edges, tracked from frame to frame. The
+  looming is the slope of a fit of ln(size) over 0.3 s, and it counts only if the region grows around
+  itself.
+- **The drone's own approach is taken out** (`gate`), as the eye does with distances. Something standing
+  still would be at its approach speed / looming. Looming is dropped when that places it beyond the stop,
+  on the map, or on the floor.
+
+Replayed on 15 recorded flights, the camera-driven brain:
+- raised 10 of the 24 alarms the eye-driven brain raised for a threat in the camera's view, at the same time;
+- raised 48 alarms the eye-driven brain didn't (~3 per flight), one in each `square` flight.
+
+**Flown on every route** (2026-10-25):
+- **Standing obstacles:** `blocked`, `wallside`, `poles` and `landing` delivered with no contact. The brain
+  chose most sides: 18 of 24 episodes there.
+- **`square`:** 2 false alarms.
+- **People and the cart:** contacts in 6 of the 8 routes with movers. In `cart` and `lane` nothing alarmed
+  before the cart hit the drone from the side.
+
+**The sensors, not the brain.** The camera sees ~86 degrees ahead. The four range rays are each a 20-degree
+fan, so a person or cart coming from the side or overtaking at an angle is in the gaps until it is too
+late. In `cb_headon` a person overtook from behind at an angle, and the rays first saw them 0.22 m off. The
+geometric rule on the same rays did no better (contacts on 5 of 11 routes, Results above). With the
+360-degree eye, the same brain had none. On a real Crazyflie's sensors, coverage limits the avoidance
+before the brain does.
+
+Next, for a real drone:
+- wider sight: a second camera, or more range sensors;
+- full-resolution frames: the camera gives 324 x 244; the recordings keep half;
+- or a sensor made for looming: an event camera.
+
 ## Limitations, and what would be next
 
 - **The eye is ideal.** Looming, and whether something is on a collision course, are computed from the
@@ -257,10 +491,14 @@ Read this with care:
   ahead or behind, where the brain's left/right readout is too weak to rely on. It gives the
   forward/back part of the escape. For a moving threat it gives the whole direction (out of its path),
   since the brain's two input channels can't tell where a threat is heading.
-- **One input channel per eye.** All of an eye's LC4/LPLC2 neurons get the same rate, so the brain
-  can't tell where in that eye the looming is. That is why the forward/back part of the escape comes
-  from the eye, not from the brain. Driving each looming detector by its own receptive field
-  (retinotopy, from the optic-lobe column maps) would give the brain the full direction.
+- **One input channel per eye (`flybrain`).** All of an eye's LC4/LPLC2 neurons get the same rate, so
+  that brain can't tell where in the eye the looming is; the forward/back part of its escape is the eye's.
+  `flybrain-rf` drives each by its own receptive field, and its trained readout gives side and front/back
+  (Results). Where a moving threat is heading is still the eye's in both.
+- **The receptive fields are the fly's, changed twice for a drone** (`RF_STRETCH`: no blind spot behind;
+  `RF_PROFILE`: the same warning from every side). Without them it touched people coming from behind and
+  from the side. The map itself is derived, not measured: column positions from Mi1 cell bodies, oriented
+  by known receptive fields (VS, HS), stretched over an approximate field of view.
 - **Fairness of the comparison.** The other arms (CNN, shuffled connectome, abstract looming model,
   geometric rule) should get the same 360-degree eye. The geometric policy still uses the four range
   sensors.
@@ -284,7 +522,8 @@ That is what makes it crash with "out of resources".
 
 - `brain_reproduce.cmd` and `brain_validate.cmd` never run more simulations at once than free memory allows
   (`reproduce.py` `parallel_trials`), so they work on a 16 GB PC, just more slowly.
-- The drone itself only runs the 3,118-neuron circuit: well under 1 GB.
+- The drone itself only runs the 1,656-neuron circuit: well under 1 GB. The whole brain in the C engine
+  (`prune.py`) needs ~1 GB per simulation.
 - To give WSL more memory, add this to `C:\Users\<you>\.wslconfig` and run `wsl --shutdown`:
   ```
   [wsl2]
@@ -300,11 +539,17 @@ That is what makes it crash with "out of resources".
 | `reproduce.py` (`flypilot\brain_reproduce.cmd`) | check 1: the model against the paper's result, and looming -> giant fiber in the whole brain |
 | `validate.py` (`flypilot\brain_validate.cmd`) | check 2: the cut-out circuit against the whole brain, and its speed |
 | `brain_server.py` | the brain for the drone: the circuit, trading looming for spike counts every 50 ms over UDP 5320 (`--engine fast`, the default, or `brian2`) |
-| `fastlif.c`, `fastlif.py` | the C engine: the same network ~10x cheaper in flight; built with gcc by setup (`build/`, not in git) |
+| `fastlif.c`, `fastlif.py` | the C engine: the same network ~10x cheaper in flight, and the whole brain on one core (`lif_run_sparse`); built with gcc by setup (`build/`, not in git) |
+| `prune.py` (`flypilot\brain_prune.cmd`) | activity-based pruning: the whole brain on many looming tests, the neurons that fire (`active_783.txt`), held-out tests against the whole brain and the cuts; `check`: the whole brain in C against Brian2 |
+| `active_783.txt` | the pruned circuit's neurons (FlyWire ids); `circuit.active_circuit()` builds the circuit from it |
 | `check_fast.py` | the C engine against Brian2: spike for spike on the same input, the giant fibers' looming response, compute per tick |
+| `retinotopy.py` | each LC4/LPLC2 neuron's receptive field, from the connectome (cached in `cache/`; `bash py.sh retinotopy.py` prints the checks and draws `results/retinotopy.png`) |
+| `directions.py` | open loop: does the brain know where a threat is? Two channels vs receptive fields vs shuffled fields |
+| `train_readout.py` | the trained readout (`../flypilot/models/brain_readout_<circuit>.npz`, `--circuit`), from recorded flights replayed offline; `--calibrate` / `--equalize` set the receptive-field input's gains (`brain_server.RF_GAIN`, `RF_PROFILE`) |
+| `../flypilot/camera_loom.py` | looming from the AI-deck camera, for `flybrain-cam` |
 | `cache/` | the cut circuit (`circuit.escape_circuit`), so the server doesn't load the whole connectome (not in git) |
 | `setup_brain.sh`, `requirements.txt`, `py.sh` | setup (run by `flypilot/setup.sh`) and the brain's own Python environment |
-| `results/` | whole-brain results of `brain_reproduce.cmd` (not in git) |
+| `results/` | whole-brain results of `brain_reproduce.cmd`, the receptive-field map, `directions.py`'s data (not in git) |
 | `../flypilot/eye.py` | the compound eye and looming |
 | `../flypilot/policies.py` `FlyBrainPolicy` | eye -> brain -> avoid signal and escape |
 

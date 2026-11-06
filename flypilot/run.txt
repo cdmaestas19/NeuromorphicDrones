@@ -163,6 +163,14 @@ commands below assume your terminal is in the repo folder.
       timed to happen in the same place every run. They are never on the planner's map, so dodging
       them is the avoidance's job. At the end the terminal prints the closest approach to each of
       them and any contacts.
+        flypilot\launch.cmd avoid --route showcase   everything at once: cruising at 4.5 m on a map
+                                                     without trees, it dodges two tree crowns, then
+                                                     lands beside the walkway as a person walks past
+        flypilot\showcase.cmd                        the same, filmed: the 3D view follows the drone
+                                                     from behind, and the window is recorded to
+                                                     flypilot\videos\showcase_<date_time>.mp4, drawn
+                                                     after the flight (the terminal shows progress)
+                                                     (--chase / --video FILE.mp4 work on any route)
         flypilot\launch.cmd avoid --route headon     a person walks along the walkway at the drone
         flypilot\launch.cmd avoid --route hover      a person walks up behind the hovering drone
         flypilot\launch.cmd avoid --route crossing   a person crosses the drone's path from the side
@@ -194,6 +202,10 @@ commands below assume your terminal is in the repo folder.
       fruit fly's connectome. When the giant fibers fire, the drone makes an escape burst like a
       fly's takeoff: up, sideways away from the threat, and forward or back away from it.
       flybrain\README.md explains it.
+      --policy flybrain-rf   each of the brain's looming neurons sees its own patch of the view, and
+                             a small trained readout of its outputs says where the threat is
+      --policy flybrain-cam  (experimental) the same brain on the AI-deck camera, with the range
+                             sensors beside and behind
       flypilot\brain_reproduce.cmd   checks the brain model against its paper (needs ~5 GB of free
                                      memory per simulation; it runs as many at once as fit)
       flypilot\brain_validate.cmd    checks the drone's cut-out circuit against the whole brain
@@ -201,8 +213,11 @@ commands below assume your terminal is in the repo folder.
   WHAT EVERY FLIGHT DOES AROUND THE AVOIDANCE (any policy)
       - A dodge slows down rather than fly into something the eye sees.
       - After climbing to dodge, the drone comes back down only while the eye sees room below it.
-      - After each avoidance episode, unmapped static things it met (a crate, not a person) go on
-        the planner's map, so the next path goes round them: orange dots on the top views.
+      - What it dodges goes on the planner's map, so the next path goes round it: orange dots on
+        the top views. Only things that stand still (a crate, a tree; not a person or the cart), and
+        all of each: the eye sees only the near side, so a round thing (a tree's crown) is mapped as
+        the whole circle its side fits, a flat face as deep as it is wide. Going round it, the map
+        takes in more of it as it comes into view, and the path is planned again.
 
   flypilot\launch.cmd avoid --record recordings\blocked.jsonl
       Also saves every decision's inputs and outputs (one line per decision) to

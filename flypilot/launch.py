@@ -55,13 +55,15 @@ def uses_brain(script_args: list[str]) -> bool:
     """Whether the flight's policy is the fly brain (it needs flybrain/brain_server.py running)."""
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument('--policy', default='geometric')
-    return p.parse_known_args(script_args)[0].policy == 'flybrain'
+    return p.parse_known_args(script_args)[0].policy in ('flybrain', 'flybrain-rf', 'flybrain-cam')
 
 
-def start_brain(timeout: float = 180.0) -> subprocess.Popen:
-    """Start the fly-brain server (its own Python environment) and wait until it listens."""
+def start_brain(circuit: str | None = None, timeout: float = 180.0) -> subprocess.Popen:
+    """Start the fly-brain server (its own Python environment) and wait until it listens. circuit: its
+    --circuit (flybrain/circuit.py CIRCUITS); None: the server's default."""
     print('Starting the fly brain (escape circuit of the FlyWire connectome)...', flush=True)
-    brain = start('brain', ['bash', str(HERE.parent / 'flybrain' / 'py.sh'), '-u', 'brain_server.py'])
+    brain = start('brain', ['bash', str(HERE.parent / 'flybrain' / 'py.sh'), '-u', 'brain_server.py',
+                            *(['--circuit', circuit] if circuit else [])])
     deadline = time.monotonic() + timeout
     while 'ready' not in (LOG_DIR / 'brain.log').read_text(errors='replace'):
         if brain.poll() is not None:
@@ -183,6 +185,15 @@ def main():
     ap.add_argument('--screen', default='auto',
                     help='where the windows open: auto (a screen other than the main one, if there is one), '
                          'main, a number (1 = main), or off (wherever they open)')
+    ap.add_argument('--chase', action='store_true',
+                    help='the 3D view follows the drone from behind and a little above, turning with it')
+    ap.add_argument('--video', metavar='FILE.mp4',
+                    help='record that follow view (with the drone\'s camera and the dashboard on it) to this '
+                         'file, relative to flypilot\\; {time} in the name becomes the date and time. Works '
+                         'with --headless too')
+    ap.add_argument('--brain-circuit', choices=('active', 'h3', 'h4'),
+                    help='for the fly-brain policies: which circuit the brain runs (flybrain/brain_server.py '
+                         '--circuit; default: its own)')
     args, script_args = ap.parse_known_args()
     if script_args and not args.flight:
         ap.error(f'unrecognized arguments: {" ".join(script_args)}')
@@ -194,6 +205,7 @@ def main():
         ap.error(f'--camera-window cannot be combined with {args.flight}: the camera bridge serves one client, '
                  'and the avoidance demo needs it')
 
+    video = video_path(args.video) if args.video else None
     check_gpu()
     # Closing the terminal (SIGHUP) or being killed (SIGTERM) must clean up like Ctrl-C does: the sim
     # and viewers run in their own sessions, so nothing else would stop them.
@@ -215,13 +227,18 @@ def main():
         sim_env = {'SCENE': str(SCENES[scene])}
         if args.headless:
             sim_env['CRAZYSIM_HEADLESS'] = '1'  # CrazySim's launch script then leaves out the viewer (our patch)
+        if args.chase:
+            sim_env['CRAZYSIM_CHASE'] = '1'     # the viewer follows the drone (our patch)
+        if video is not None:
+            sim_env['CRAZYSIM_VIDEO'] = str(video)  # the sim records what its window shows (our patch)
+            print(f'Recording the 3D view to {windows_path(video)} (drawn when the sim closes)', flush=True)
         sim = start('sim', ['bash', 'run_sim.sh'], env=sim_env)
         procs.append(sim)
         wait_for_sim(sim)
         if dashboard is not None and not args.headless:
             procs.append(start('dashboard', [sys.executable, 'dashboard.py', *dashboard, '--scene', str(SCENES[scene])]))
         if uses_brain(script_args):
-            procs.append(start_brain())
+            procs.append(start_brain(args.brain_circuit))
         if args.camera_window:
             camera = start('camera', [sys.executable, 'camera_view.py'])
             procs.append(camera)
@@ -242,11 +259,57 @@ def main():
         for proc in reversed(procs):
             stop(proc)
         stop_leftovers()
+        if video is not None:
+            wait_for_video(video)
         print('Done.', flush=True)
 
 
 def _interrupt(_sig, _frame):
     raise KeyboardInterrupt
+
+
+def video_path(name: str) -> Path:
+    """--video's file: relative to flypilot/, {time} replaced by the date and time, .mp4 added if missing."""
+    path = Path(name.replace('{time}', time.strftime('%Y%m%d_%H%M%S')))
+    path = path if path.is_absolute() else HERE / path
+    return path if path.suffix else path.with_suffix('.mp4')
+
+
+def wait_for_video(path: Path):
+    """The sim draws its video once it has closed, in a process of its own (crazysim.py VideoRecorder,
+    render_video: frame by frame, at full quality): wait for it, showing how far it is. Ctrl-C stops
+    waiting; the drawing goes on."""
+    parts = Path(str(path) + '.parts')
+    deadline, shown = time.monotonic() + 60.0, None
+    try:
+        while not path.exists():
+            if not parts.exists():
+                print('No video was made (see logs/sim.log).', flush=True)
+                return
+            try:
+                done, total, secs = (parts / 'progress').read_text().split()
+                pct = int(100 * int(done) / int(total))
+                if shown is None or pct >= shown + 10:
+                    left = float(secs) * (int(total) - int(done)) / max(int(done), 1)
+                    print(f'Drawing the video: {pct}% (about {left / 60:.0f} min to go)', flush=True)
+                    shown = pct
+                deadline = time.monotonic() + 60.0
+            except (OSError, ValueError):
+                if time.monotonic() > deadline:
+                    print(f'The video isn\'t being drawn (see {windows_path(parts)}\\render.log).', flush=True)
+                    return
+            time.sleep(2.0)
+        print(f'Video ready: {windows_path(path)}', flush=True)
+    except KeyboardInterrupt:
+        print(f'Not waiting: the video is still being drawn, to {windows_path(path)}', flush=True)
+
+
+def windows_path(path: Path) -> str:
+    """How Windows sees a path under /mnt/c (else the path itself)."""
+    parts = path.parts
+    if len(parts) > 3 and parts[1] == 'mnt' and len(parts[2]) == 1:
+        return parts[2].upper() + ':\\' + '\\'.join(parts[3:])
+    return str(path)
 
 
 def stop_leftovers():

@@ -103,15 +103,77 @@ def escape_circuit(version: str = '783', hops: int = HOPS, min_synapses: int = M
                 return {k: d[k] for k in d.files}
     conn = Connectome(version)
     ins, outs, ids = extract(conn, hops, min_synapses)
+    return _save(path, _arrays(conn, ins, outs, ids), stamp)
+
+
+def whole_circuit(version: str = '783') -> dict:
+    """The whole brain (every neuron, every connection) in escape_circuit()'s form, for fastlif.FastCircuit:
+    the same inputs (in the same order, so the same seed gives the same input spikes) and outputs. In C it
+    needs ~0.3 GB and runs on one core where the model repo's Brian2 run needs 4.3 GB (prune.py)."""
+    from connectome import BRAIN_MODEL_DIR, VERSIONS
+    source = BRAIN_MODEL_DIR / VERSIONS[version][1]
+    stamp = f'{CUT_VERSION}:{source.stat().st_size}:{int(source.stat().st_mtime)}'
+    path = CACHE_DIR / f'whole_{version}.npz'
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as d:
+            if str(d['stamp']) == stamp:
+                return {k: d[k] for k in d.files}
+    conn = Connectome(version)
+    ins = [f for t in INPUT_TYPES for f in conn.cells(t)]
+    return _save(path, _arrays(conn, ins, outputs(conn), sorted(int(f) for f in conn.ids)), stamp)
+
+
+ACTIVE_IDS = Path(__file__).resolve().parent / 'active_783.txt'  # prune.py's neuron list (in git)
+
+
+def active_circuit(version: str = '783') -> dict:
+    """The circuit pruned by activity (prune.py): the neurons that spiked while the whole brain ran the
+    looming tests, every input and output, and every connection among them. From cache/, else built from
+    the neuron list prune.py keeps in git (ACTIVE_IDS), so setup needs the connectome, not the tests."""
+    import hashlib
+    from connectome import BRAIN_MODEL_DIR, VERSIONS
+    source = BRAIN_MODEL_DIR / VERSIONS[version][1]
+    text = ACTIVE_IDS.read_text()
+    stamp = (f'{CUT_VERSION}:{source.stat().st_size}:{int(source.stat().st_mtime)}:'
+             f'{hashlib.sha1(text.encode()).hexdigest()[:12]}')
+    path = CACHE_DIR / f'active_{version}.npz'
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as d:
+            if str(d['stamp']) == stamp:
+                return {k: d[k] for k in d.files}
+    conn = Connectome(version)
+    ids = sorted(int(line) for line in text.split('\n') if line.strip() and not line.startswith('#'))
+    ins = [f for t in INPUT_TYPES for f in conn.cells(t)]
+    return _save(path, _arrays(conn, ins, outputs(conn), ids), stamp)
+
+
+CIRCUITS = ('active', 'h3', 'h4')  # brain_server.py --circuit: pruned by activity, or cut 3 / 4 synapses deep
+
+
+def flight_circuit(name: str) -> dict:
+    """A circuit by name: CIRCUITS, or 'whole'."""
+    if name == 'active':
+        return active_circuit()
+    if name == 'whole':
+        return whole_circuit()
+    return escape_circuit('783', int(name[1:]), MIN_SYNAPSES)
+
+
+def _arrays(conn: Connectome, ins: list, outs: list, ids: list) -> dict:
+    """A circuit of these neurons (FlyWire ids) and every connection among them, as escape_circuit() returns
+    it."""
     pos = {f: i for i, f in enumerate(ids)}
     pre, post, count = connections(conn, ids)
     dn = [(conn.name(f), pos[f]) for f in outs if not conn.name(f).startswith(GIANT_FIBER)]
-    out = {'ids': np.array(ids, np.int64), 'inputs': np.array([pos[f] for f in ins], np.int64),
-           'input_left': np.array([conn.labels.side.get(f) == 'left' for f in ins]),
-           'pre': pre.astype(np.int32), 'post': post.astype(np.int32), 'count': count.astype(np.int32),
-           'gf': np.array([pos[conn.cells(GIANT_FIBER, s)[0]] for s in ('left', 'right')], np.int64),
-           'dn_names': np.array([n for n, _ in dn]), 'dn_pos': np.array([i for _, i in dn], np.int64),
-           'stamp': np.array(stamp)}
+    return {'ids': np.array(ids, np.int64), 'inputs': np.array([pos[f] for f in ins], np.int64),
+            'input_left': np.array([conn.labels.side.get(f) == 'left' for f in ins]),
+            'pre': pre.astype(np.int32), 'post': post.astype(np.int32), 'count': count.astype(np.int32),
+            'gf': np.array([pos[conn.cells(GIANT_FIBER, s)[0]] for s in ('left', 'right')], np.int64),
+            'dn_names': np.array([n for n, _ in dn]), 'dn_pos': np.array([i for _, i in dn], np.int64)}
+
+
+def _save(path: Path, out: dict, stamp: str) -> dict:
+    out['stamp'] = np.array(stamp)
     CACHE_DIR.mkdir(exist_ok=True)
     tmp = path.with_suffix(f'.{os.getpid()}.tmp.npz')
     np.savez_compressed(tmp, **out)

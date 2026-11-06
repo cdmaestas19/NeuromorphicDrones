@@ -69,13 +69,23 @@ rule. A negative result is an acceptable result.
   (straight-line fit over 0.25 s, ignored while turning / moving across the
   ray / on jumps); recorded static flights replay with identical decisions.
 - Flight-side safety around any policy (`avoid_demo.py`): speed capped so the
-  TTC to mapped obstacles stays > 2.5 s (along the rays and the path corridor),
+  TTC to mapped obstacles stays > 2.5 s (along the rays and the path corridor;
+  `planner.distance_ahead(z=)`: the mapped obstacles at the drone's actual
+  height, any height: a drone left high by an escape flew into a 1.5 m beam
+  the 0.5 m plan didn't have),
   a dodge slows rather than fly into what the eye sees (`_dodge_safe`), the
   clear-out backs a finished dodge out of the resume clearance (from the eye
   when there is one), setpoint kept 0.1 m inside the geofence (0.4 m below the
   ceiling), descents only while the eye sees room below (`eye.clear_below`:
-  steep rays' hits within 0.6 m horizontally; walls beside it aren't below),
-  landing with the avoidance on down to 0.3 m (`_land`). The setpoint leash
+  steep rays' hits within 0.6 m horizontally; walls beside it aren't below;
+  hits on what the map has count only within 0.2 m, `planner.mapped_at`, not
+  where a mover was lately: a crate 0.54 m beside home held a landing 30 s, and
+  in the obstacles room an escape's climb to 2 m was never undone),
+  landing with the avoidance on down to 0.3 m (`_land`), turns to face a leg
+  with the avoidance on (`_turn_to`; `pilot.turn_to` turned blind: the cart hit
+  a drone turning in its lane, ac1_cart), a stall watchdog (`STALL_S` 2 s
+  without a decision: faulthandler dumps every thread's stack to the log;
+  the firmware cuts the motors ~2 s after setpoints stop). The setpoint leash
   (`flight.step_velocity`) is per axis: a lagging climb mustn't freeze a
   sideways escape. Contacts count height per part (`movers.Shape.parts`, one
   per geom: over the cart's front body isn't touching it, its higher cabin
@@ -86,9 +96,36 @@ rule. A negative result is an acceptable result.
 - The compound eye is a sensor of the flight, not of one policy: `avoid_demo`
   owns the `EyeSource` and passes the reading in `Sensors.eye` to every policy.
   The resume gate's clearance comes from it (`eye.clearance`: nearest thing
-  within +-100 deg of the heading). After each episode, static things the eye
-  sees within 1.2 m that aren't mapped go on the planner's map
-  (`planner.add_seen`; orange dots on the top views): the map now grows.
+  within +-100 deg of the heading). The map grows from what the avoidance
+  meets (`planner.add_seen`; orange dots on the top views), as whole objects:
+  `eye.footprint` completes the side the eye sees (circle fit, if it bulges
+  toward the eye mid-chord (a face + one corner point bulges at its end) and
+  spans >= 70% of the front such a circle shows -> the whole
+  disc for crowns/poles/people standing; two faces of a box <= 2 m -> mirrored
+  across their chord; one flat face -> 0.3-0.6 m deep, straight back along its
+  normal, not along the view rays: a slanted view overshot the far side). An
+  object's points on scene obstacles already mapped (`planner.mapped_at`, at
+  the height each ring point was hit, `SeenObject.z`) are dropped first: a
+  wall + the cart's side made one "corner" mirrored across the courtyard, and
+  a beam seen from 1.15-1.5 m went on the 0.5 m map (both: no path home).
+  `add_seen` takes a point if its 5 cm cell has none yet (not: if it is outside
+  the clearance round the others: a crate's far face 0.1 m beyond the guess
+  was never added, the path home passed it at 0.2 m, 9 dodges).
+  During an episode, static things on a collision course go on the map
+  (`_map_threats`); after it, static things within 2.5 m; while flying on,
+  more of what is already on the map as it comes into view (`_grow_map`,
+  every 0.5 s); each growth bumps `orders.map_version` -> re-plan. The eye's
+  tracker ignores the motion of a not-yet-moved object while its width
+  changes (`EMERGE_M`: a crown rising into view during the climb had been
+  tagged a moving vehicle, never mapped, 9-10 dodges at tree1). Only before
+  it ever moved, and at 0.5 m: applied to people, or at 0.25 m (ray spacing
+  makes a walker 0 -> 0.3 m wide), it hid one walking up behind a hovering
+  drone (contacts in headon, hover). Nothing that moves now, nor anything
+  within 0.5 m of where a mover was in the last 20 s
+  (`CollisionCourse.near_movers`: a paused cart re-found as a new track),
+  goes on the map. Climbs brake below mapped obstacles overhead within 0.35 m
+  sideways (`planner.room_above`; an escape slid under the obstacles room's
+  1.5 m beam, hit it, fell and bounced through the geofence).
 - Cruise height: `--cruise M` (routes' `cruise_m`; street deliveries cruise at
   4.5 m, `routes.DELIVERY_CRUISE_M`) flies between stops at M; vertical 1 m/s,
   0.4 m/s below 1.5 m; climbs brake before the ceiling (street: 8 m buildings,
@@ -98,12 +135,26 @@ rule. A negative result is an acceptable result.
   (`eye.points_near`, `orders.obstacle_gap`); wait, after 6 s come down at the
   nearest clear spot on rings 0.9-2.4 m; the descent (and the final landing)
   pauses while the spot is taken. `Sensors.route_stop_m` is an efference copy
-  of where the route will stop.
+  of how far the route goes on straight ahead: to the stop or to the first
+  turn > 30 deg (`avoid_demo._straight_ahead`; ending only at the stop, a wall
+  past a corner waypoint loomed and the fly brain looped for 10 min).
 - Windows: `launch.cmd ... --screen auto|main|N|off` (`screens.py`: XRandR
   monitors via ctypes, Windows' main screen via powershell.exe, windows moved
   with xdotool once as they appear; default auto = a non-main screen);
   `--headless` opens none (CrazySim's sitl_camera.sh drops `--vis` when
   CRAZYSIM_HEADLESS=1, our patch; no dashboard). Test suites run headless.
+  `--chase` (CRAZYSIM_CHASE=1: the viewer follows drone 0 from 1 m behind,
+  22 deg above, heading smoothed) and `--video FILE` (CRAZYSIM_VIDEO). Live
+  offscreen recording got ~10 fps (WSL2's GL translation serializes all
+  contexts; readback ~40 ms), so the sim only logs per 30 fps slot (qpos,
+  mocap, prop quats, mat_rgba, viewer cam/opt, markers, RTF; FPV + dashboard
+  panel as ffmpeg side streams in FILE.parts/) and on exit (SIGTERM handled)
+  spawns `crazysim.py --render-video DIR`, which draws every frame with
+  MuJoCo's own calls (`_FrameDrawer`: text overlay BEFORE drawPixels, else
+  images come out white) to H.264 (imageio-ffmpeg); launch.py waits with
+  progress; stop_sim.sh spares the renderer. Propellers spin visually at
+  1/40 real speed (`PROP_VISUAL_SPEED`, massless bodies' body_quat).
+  `flypilot\showcase.cmd` = showcase, flybrain-rf, chase, video to `videos/`.
 - Moving obstacles: `scenes/street.xml`, a 12 x 12 m courtyard (walkway y 2..4,
   road x 1.5..4.5, static trees/benches/kiosk/crates) with three people and a
   golf-cart-sized cart as mocap bodies, moved over UDP 5312 by `movers.py`
@@ -112,8 +163,10 @@ rule. A negative result is an acceptable result.
   reaches the drone mid-lane), `dropoff` (cruise at 4.5 m, a person walks into
   the drop-off point), `wallside` (unmapped crate3 by the south wall: the map's
   veto), `poles` (unmapped 6 m new_pole1 at cruise height), `landing` (the stop
-  is where the cart is parked), and `deliver --scene street`. The 'building'
-  map leaves out crate* and new_*. Each run logs the closest approach and contacts. Mocap bodies need an
+  is where the cart is parked), `showcase` (map 'notrees': both tree crowns
+  at cruise height, then it lands at the last stop, `Route.home=False`,
+  beside the walkway as a person passes), and `deliver --scene street`. The
+  'building' map leaves out crate* and new_*; 'notrees' tree* too. Each run logs the closest approach and contacts. Mocap bodies need an
   explicit `<inertial>`: without one (inertiafromgeom="false") a rotated mover is
   invisible to mj_multiRay, i.e. to the compound eye.
 - The fly brain (`flybrain/`, see flybrain/README.md), policy `flybrain`:
@@ -124,13 +177,30 @@ rule. A negative result is an acceptable result.
     objects = runs of similar depth, tracked; centroid velocity without its
     largest reading-to-reading step (a crate face coming into view is one jump);
     static below 0.5 m/s or when it moves like parallax of the drone's own
-    motion; "moved" needs 3 readings of steady motion; counts if a point passes
+    motion, or when >= half its points lie on the scene's mapped obstacles
+    (`Sensors.mapped` = `planner.mapped_at(seen=False)`; walls/beam/partition
+    slid along as their visible stretch changed and counted as movers: 11
+    dodges of a wall; not what the drone mapped itself, which may be a person
+    who stood still; bench.py replays without it);
+    "moved" needs 3 readings of steady motion; counts if a point passes
     within 0.15 m, not beyond 0.3 m): LPLC2's selectivity.
     Ideal/geometric, not image-based.
-  - `brain_server.py`: the escape subcircuit (paths <= 3 synapses from LC4/LPLC2
-    to DNp01 + 35 other DNs, connections >= 5 synapses: 3,118 neurons) of the
-    Shiu et al. LIF model, stepped every 50 ms over UDP 5320; integrates at
-    0.2 ms in flight (same GF response as 0.1 ms). Engine `fast` (default):
+  - `brain_server.py --circuit active|h3|h4` (default `active`; `launch.cmd
+    --brain-circuit`): a circuit of the Shiu et al. LIF model, stepped every
+    50 ms over UDP 5320; integrates at 0.2 ms in flight (same GF response as
+    0.1 ms). `active` (2026-10-26, mentor feedback: "run the whole brain on many
+    tests, keep what spikes"): `flybrain/prune.py` ran the whole brain on 120
+    looming tests x 2 seeds (spheres from every 30 deg, 2 sizes/speeds; 12
+    recorded flights, both input forms): 1,654 neurons spiked -> 1,656 with
+    all inputs/outputs, 131k connections (`flybrain/active_783.txt` in git,
+    `circuit.active_circuit()`). Lossless on training tests (a neuron acts only
+    by spiking); on 44 held-out tests x 2 seeds identical to the whole brain in
+    82/88 runs, 0 alarms missed/extra; the old 3-hop cut `h3` (paths <= 3
+    synapses LC4/LPLC2 -> DNp01 + 35 DNs, >= 5 synapses, 3,118 neurons: 2,181
+    of them never fired, 717 active neurons outside it) 4/88, 6 missed + 6
+    extra; `h4` (18,326) 4/88, 2 + 1. Flown: all routes clean, 1.0-1.8 ms per
+    tick. Readout per circuit (`models/brain_readout_<circuit>.npz`; the reset
+    reply names the circuit, `FlyBrainRFPolicy` loads its readout). Engine `fast` (default):
     `fastlif.c` via ctypes, the same network spike for spike (`check_fast.py`;
     Brian2 drops input to refractory "(unless refractory)" variables, the C
     does too; tiny values flushed to 0, subnormals cost 10x), ~2 ms per tick in
@@ -138,6 +208,14 @@ rule. A negative result is an acceptable result.
     (`circuit.escape_circuit`, `flybrain/cache/`, built by setup_brain.sh).
     `--engine brian2` is the reference; `--hops 4` now fits (~30 ms). Non-blocking both
     ways: the flight uses the newest reply, the server skips to the newest step.
+    The whole brain runs in the same C kernel (`circuit.whole_circuit`, mentor
+    feedback "fast CPU, not GPU"): matches the model repo's Brian2 runs (99-100%
+    of firing neurons, r 0.999, all 8 GF rates; `prune.py check`); from 10k
+    neurons `lif_run_sparse` steps only neurons not at rest (bit-identical,
+    3.1x): ~0.9 s per simulated s on one core, ~1 GB (Brian2: 4.3 GB), 240
+    whole-brain runs in 5 min; peaks ~95 ms per 50 ms tick, so not in flight
+    yet. Brian2GeNN (other feedback) not used: GeNN is batch-oriented and WSL
+    has no CUDA toolkit; the CPU made it unnecessary.
   - `FlyBrainPolicy`: signal = max giant-fiber rate / 100 Hz; left eye drive x
     1.35 (EYE_GAIN: the connectome's left pathway is less sensitive); side =
     away from the stronger steering DNs (DNp02/04/06/11), or, when they are
@@ -175,7 +253,23 @@ rule. A negative result is an acceptable result.
 - Policies: `geometric` (default, four Multi-ranger rays decide when; the eye
   and camera only say what a threat is, the map which side), `geometric360`
   (EXPERIMENTAL 360-degree version: false movers on oblique surfaces, its
-  maneuver re-triggers in clutter), `flybrain`.
+  maneuver re-triggers in clutter), `flybrain`, `looming` (comparison arm:
+  the abstract looming model, `LoomingModelPolicy` = FlyBrainPolicy with the
+  decider swapped, `_connect` / `_think`: alarm linear in the summed looming
+  drive, 50 Hz at 0.13 = the brain's head-on alarm point; same eye, escapes,
+  delay and smoothing), `flybrain-rf` (`FlyBrainRFPolicy`: the eye sends
+  looming per ommatidium, `eye.Looming.loom_points`; the server drives each
+  LC4/LPLC2 by its own receptive field, `brain_server.Inputs` with
+  `RF_STRETCH` (no blind spot behind), `RF_PROFILE` (equal warning from every
+  side, per eye) and `RF_GAIN`; a trained linear readout of all 37 outputs ->
+  bearing, `flybrain/train_readout.py` -> `models/brain_readout_<circuit>.npz`; side and
+  front/back of a standing threat's escape from it; movers still the eye's),
+  `flybrain-cam` (EXPERIMENTAL `FlyBrainCamPolicy`: no eye; AI-deck camera ->
+  `camera_loom.py` (edge-bounded regions tracked, ln-size fit = looming, grows
+  around itself; `gate()`: the drone's own approach to what is beyond the stop,
+  on the map or the floor dropped) -> the same brain and readout; the
+  geometric rule on the Multi-ranger beside/behind, its front ray a safety net
+  at half weight).
 - Decision timing (Python): the geometric rule alone ~3.6 us replayed; with the
   eye's object tracking ~0.57 ms; camera network ~0.2 ms per look; live ~1.5 ms
   (geometric) and ~1.6 ms (fly brain, plus the brain's own ~2 ms in its
@@ -191,13 +285,35 @@ two fixes should go upstream.
 ## Known limitations we are deliberately working on
 - Nothing tested on hardware.
 - The fly brain's eye is ideal: its collision-course selectivity is LPLC2's
-  function computed geometrically, not its mechanism. Next steps: a motion-based
-  (T4/T5 -> LPLC2-like) front end, and retinotopic input to LC4/LPLC2 so the
-  brain itself sees front vs back (today the eye supplies front/back and the
-  side for near-frontal threats).
+  function computed geometrically, not its mechanism. Next steps: a camera
+  front end that works (see camera bullet below). Retinotopic input: done
+  (`flybrain-rf`); a mover's heading is still the eye's (next: from the
+  readout's bearing over time).
+- Retinotopy (2026-10-25): `flybrain/retinotopy.py` derives each LC4/LPLC2
+  receptive field from the connectome (Mi1 cell-body sheet -> harmonic
+  extension over 33 columnar types -> each detector's inputs; oriented by
+  FlyWire y/z, signed by VS1..8 order, HS order as check).
+  `flybrain/directions.py` (open loop): per-neuron fields let a linear readout
+  of the DNs get direction to 3 deg, but a shuffled map nearly matches it:
+  own patches matter, the specific map barely. Flown as `flybrain-rf`: no
+  contacts on 12 routes, closest approaches as good or better than
+  `flybrain`'s; readout 6 deg median, L/R 100%. The fly's raw map touched
+  people from behind/side (blind spot, frontal bias): hence RF_STRETCH and
+  RF_PROFILE. User's slide goal: camera -> SNN -> small trained readout ->
+  controller, range sensors -> controller; the slide says MaleCNS, the code
+  uses FlyWire (the user should fix the slide).
+- Camera looming is the weak link: dense-flow and four-arm LPLC2 versions
+  failed at half resolution (a person 2 m off moves ~0.5 px/frame, under the
+  drone's own image motion; plain sim surfaces carry no motion inside them).
+  The tracked-region version catches ~10 of 24 eye alarms in view, ~3 extra
+  alarms per flight. Flown: static routes fine, contacts on 6 of 8 mover
+  routes: the real Crazyflie's sensors (camera ahead + 4 thin rays) don't see
+  a cart from the side or a person overtaking at an angle (cb_headon), as the
+  geometric rule on the same rays didn't. Coverage, not the brain, limits it.
 - The other comparison arms need the same 360-degree eye for a fair comparison;
   the geometric policy still uses the four range sensors (geometric360 isn't
-  ready).
+  ready). Done: the abstract looming model (`--policy looming`). Next: the
+  shuffled connectome (the C engine makes it cheap), then a CNN arm.
 - Car vs person (user: both policies; eye now, camera next): the eye's size
   (`eye.CollisionCourse`: moving and > 0.75 m wide = vehicle, < = person,
   > 3 m = unknown, decides nothing) and a camera CNN (`camera_kind.py`, trained

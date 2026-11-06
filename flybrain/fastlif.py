@@ -53,20 +53,24 @@ def build() -> Path:
     return LIB
 
 
-def _kernel():
+def _kernel(sparse: bool = False):
     lib = ctypes.CDLL(str(build()))
-    f = lib.lif_run
+    f = lib.lif_run_sparse if sparse else lib.lif_run
     d1, i32, i64 = npc.ndpointer(np.float64, flags='C'), npc.ndpointer(np.int32, flags='C'), npc.ndpointer(np.int64, flags='C')
-    u8 = ctypes.c_void_p
-    f.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int64,
-                  d1, d1, i64, i32,
-                  ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
-                  i32, i32, d1,
-                  d1, ctypes.c_int, ctypes.c_int,
-                  ctypes.c_int, i32, d1, ctypes.c_double, u8,
-                  npc.ndpointer(np.uint64, flags='C'), i32, i32]
+    u8, b1 = ctypes.c_void_p, npc.ndpointer(np.uint8, flags='C')
+    f.argtypes = ([ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+                   d1, d1, i64, i32,
+                   ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+                   i32, i32, d1,
+                   d1, ctypes.c_int, ctypes.c_int]
+                  + ([i32, i32, b1, i32, i32, b1] if sparse else [])
+                  + [ctypes.c_int, i32, d1, ctypes.c_double, u8,
+                     npc.ndpointer(np.uint64, flags='C'), i32, i32])
     f.restype = ctypes.c_long
     return f
+
+
+SPARSE_MIN = 10_000  # neurons: from this size FastCircuit visits only the neurons not at rest (lif_run_sparse)
 
 
 def _steps(ms_: float, dt_ms: float) -> int:
@@ -80,8 +84,11 @@ class FastCircuit:
     params: model_params()'s (the default)."""
 
     def __init__(self, n: int, pre, post, count, idx_in, dt_ms: float = 0.1, seed: int | None = None,
-                 params: dict | None = None):
-        self._run = _kernel()
+                 params: dict | None = None, sparse: bool | None = None):
+        """sparse: step only the neurons not at rest (lif_run_sparse; the same result bit for bit, much faster
+        when few of many neurons are busy: the whole brain); default: from SPARSE_MIN neurons."""
+        self.sparse = n >= SPARSE_MIN if sparse is None else bool(sparse)
+        self._run = _kernel(self.sparse)
         self.p = p = params or model_params()
         self.n, self.dt_ms = int(n), float(dt_ms)
         order = np.argsort(np.asarray(pre), kind='stable')
@@ -116,6 +123,13 @@ class FastCircuit:
         self.last = np.full(self.n, -(1 << 40), np.int64)
         self.ring = np.zeros(self.D * self.n, np.float64)
         self.t = 0
+        if self.sparse:  # nothing queued, every neuron at rest
+            self.pend = np.zeros(self.D * self.n, np.int32)
+            self.npend = np.zeros(self.D, np.int32)
+            self.mark = np.zeros(self.D * self.n, np.uint8)
+            self.act = np.zeros(self.n, np.int32)
+            self.nact = np.zeros(1, np.int32)
+            self.in_act = np.zeros(self.n, np.uint8)
 
     def run(self, duration_ms: float, in_spikes: np.ndarray | None = None) -> np.ndarray:
         """Advance the network; spike counts of every neuron during this run. in_spikes (steps x inputs, 0/1):
@@ -125,9 +139,10 @@ class FastCircuit:
         spikes = None
         if in_spikes is not None:
             spikes = np.ascontiguousarray(in_spikes[:steps], np.uint8)
+        sparse = (self.pend, self.npend, self.mark, self.act, self.nact, self.in_act) if self.sparse else ()
         self._run(self.n, steps, self.t, self.v, self.g, self.last, self.rfc,
                   self.ev, self.eg, self.cvg, self.p['v_0'], self.p['v_rst'], self.p['v_th'],
-                  self.row_ptr, self.post, self.w, self.ring, self.D, self.delay,
+                  self.row_ptr, self.post, self.w, self.ring, self.D, self.delay, *sparse,
                   len(self.idx_in), self.idx_in, self.p_in, self.kick,
                   None if spikes is None else spikes.ctypes.data, self.rng, counts, self._spk)
         self.t += steps

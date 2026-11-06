@@ -40,8 +40,9 @@ SCENES = {  # name -> scene file; launch.py starts the sim on the one a route as
 CELL_M = 0.05
 CLEARANCE_M = 0.3   # planned paths keep this far from mapped obstacles (stops need orders.KEEP_OUT_M = 0.35)
 EDGE_M = 0.1        # and this far inside the geofence
-MAPS = ('all', 'building', 'none')
+MAPS = ('all', 'building', 'notrees', 'none')
 MAP_HELP = {'all': 'every obstacle is mapped', 'building': 'crates, new poles not mapped: avoidance handles them',
+            'notrees': 'as building, and no trees (a street map has none): avoidance handles them',
             'none': 'nothing mapped: straight lines'}
 
 _SQ2 = math.sqrt(2.0)
@@ -51,6 +52,7 @@ FIELD_STEP = 2      # the cost-to-go field uses every other grid cell (10 cm)
 _SQ5 = math.sqrt(5.0)
 _FIELD_MOVES = _MOVES + tuple((a * i, b * j, _SQ5) for i, j in ((1, 2), (2, 1)) for a in (1, -1) for b in (1, -1))
 DRONE_M = 0.1       # route_cost: an escape must keep this far from a mapped obstacle's surface
+ON_MAP_M = 0.1      # mapped_at(): an eye hit this close to a mapped obstacle is on it (ray spacing, noise)
 
 
 def load_obstacles(path: Path = SCENE) -> list:
@@ -124,10 +126,11 @@ def geofence(path: Path = SCENE) -> dict:
 
 def on_map(name: str, map_name: str) -> bool:
     """Whether the obstacle called `name` is on the planner's map `map_name`: 'building' leaves out the
-    clutter (crate*) and what went up after the map was made (new_*)."""
+    clutter (crate*) and what went up after the map was made (new_*); 'notrees' the trees (tree*) too."""
     if map_name == 'none':
         return False
-    return map_name == 'all' or not name.startswith(('crate', 'new_'))
+    unmapped = ('crate', 'new_') + (('tree',) if map_name == 'notrees' else ())
+    return map_name == 'all' or not name.startswith(unmapped)
 
 
 class Planner:
@@ -135,6 +138,7 @@ class Planner:
 
     def __init__(self, obstacles, fence: dict, altitude: float, map_name: str = 'all'):
         self.altitude = altitude
+        self._all = list(obstacles)  # at every height: distance_ahead() at the drone's own height
         self.obstacles = [o for o in obstacles if _spans(o, altitude)]
         (self.x0, x1), (self.y0, y1) = fence['x'], fence['y']
         self.nx = int(round((x1 - self.x0) / CELL_M)) + 1
@@ -145,6 +149,7 @@ class Planner:
         m = EDGE_M - 1e-6  # a stop exactly EDGE_M inside the fence is allowed (orders.FENCE_MARGIN_M)
         self._edge = ((self._X < self.x0 + m) | (self._X > x1 - m) | (self._Y < self.y0 + m) | (self._Y > y1 - m))
         self.seen = np.zeros(self._edge.shape, bool)  # cells near obstacles the drone saw that aren't on the map
+        self._seen_cells = np.zeros(self._edge.shape, bool)  # ...the cells of their points themselves
         self.seen_points = []                          # [(x, y)]: what was added, for the top views
         self._field = self._field_goal = None          # cost_field()
         self.set_map(map_name)
@@ -156,6 +161,7 @@ class Planner:
             raise ValueError(f'unknown map {map_name!r}; choose from {MAPS}')
         self.map_name = map_name
         self.mapped = [o for o in self.obstacles if on_map(o[3], map_name)]
+        self._mapped_all = [o for o in self._all if on_map(o[3], map_name)]
         blocked = self._edge.copy()
         for kind, pos, size, _ in self.mapped:
             if kind == 'box':
@@ -168,20 +174,24 @@ class Planner:
         self._update_blocked()
 
     def add_seen(self, points) -> int:
-        """Put an obstacle the drone saw (its surface points, world x, y) on the map: from now on paths keep
-        CLEARANCE_M from those points, as from a mapped obstacle. Returns the number of grid cells newly
-        blocked (0: already known)."""
-        before = int(self.seen.sum())
+        """Put an obstacle the drone saw (its points, world x, y) on the map: from now on paths keep
+        CLEARANCE_M from those points, as from a mapped obstacle. Returns the number of points that were new
+        (0: a point in each of their cells already). New means not on a point, rather than outside the
+        clearance round the points: a crate's far face, 0.1 m beyond where its footprint had guessed it,
+        was never added, and the path home passed it at 0.2 m, dodging it nine times (fc_blocked)."""
+        added = 0
         for x, y in points:
+            i, j = self._cell(x, y)
+            if not self._inside(i, j) or self._seen_cells[i, j]:
+                continue
+            self._seen_cells[i, j] = True
             i0, i1 = self._cell(x - CLEARANCE_M, y - CLEARANCE_M), self._cell(x + CLEARANCE_M, y + CLEARANCE_M)
             a0, a1 = max(i0[0], 0), min(i1[0] + 1, self.nx)
             b0, b1 = max(i0[1], 0), min(i1[1] + 1, self.ny)
-            if a0 >= a1 or b0 >= b1:
-                continue
             near = np.hypot(self._X[a0:a1, b0:b1] - x, self._Y[a0:a1, b0:b1] - y) < CLEARANCE_M
             self.seen[a0:a1, b0:b1] |= near
             self.seen_points.append((float(x), float(y)))
-        added = int(self.seen.sum()) - before
+            added += 1
         if added:
             self._update_blocked()
         return added
@@ -247,12 +257,20 @@ class Planner:
         nx, ny = self._field.shape
         return float(self._field[i, j]) if 0 <= i < nx and 0 <= j < ny else math.inf
 
-    def distance_ahead(self, x: float, y: float, ux: float, uy: float, max_d: float) -> float:
+    def distance_ahead(self, x: float, y: float, ux: float, uy: float, max_d: float, z: float | None = None) -> float:
         """Distance from (x, y) along the unit direction (ux, uy) to the first mapped obstacle surface
         (exact, not the grown grid), or max_d if there is none closer. The same thing a range-sensor ray
-        would measure, if only the mapped obstacles existed."""
+        would measure, if only the mapped obstacles existed. z: the drone's height, when it may not be the
+        planned one (an escape climbed): then what is mapped at that height counts, at any height the map
+        has, and nothing it is above or below (by DRONE_M). An escape that climbed over a bench isn't stuck
+        behind it; one left at 1.6 m by a crate beside it (no room below to come down) flew the route home
+        into a beam 1.42-1.58 m up that the plan, at 0.5 m, knew nothing of (na_blocked)."""
         best = max_d
-        for kind, pos, size, _ in self.mapped:
+        for kind, pos, size, _ in (self.mapped if z is None else self._mapped_all):
+            if z is not None:
+                half_h = size[2] if kind == 'box' else size[1]
+                if pos[2] + half_h < z - DRONE_M or pos[2] - half_h > z + DRONE_M:
+                    continue
             if kind == 'box':
                 t0, t1 = -math.inf, math.inf
                 for o, u, c, h in ((x, ux, pos[0], size[0]), (y, uy, pos[1], size[1])):
@@ -273,6 +291,51 @@ class Planner:
                     if t >= 0.0 or -b + math.sqrt(disc) >= 0.0:
                         best = min(best, max(t, 0.0))
         return best
+
+    def room_above(self, x: float, y: float, z: float, radius: float) -> float:
+        """How far up from height z the underside of the nearest mapped obstacle is, of those reaching
+        within `radius` (horizontally) of (x, y); inf if none. An escape climbing while it slides sideways
+        went up under a beam the single upward range ray saw only once it was overhead, at 0.02 m
+        (nc_blocked: it hit the beam, fell to the floor and bounced through the geofence)."""
+        best = math.inf
+        for kind, pos, size, _ in self._mapped_all:
+            half_h = size[2] if kind == 'box' else size[1]
+            bottom = pos[2] - half_h
+            if bottom < z - 0.05:
+                continue  # beside or below the drone: not above it
+            if kind == 'box':
+                d = math.hypot(max(abs(x - pos[0]) - size[0], 0.0), max(abs(y - pos[1]) - size[1], 0.0))
+            else:
+                d = max(math.hypot(x - pos[0], y - pos[1]) - size[0], 0.0)
+            if d <= radius:
+                best = min(best, bottom - z)
+        return best
+
+    def mapped_at(self, points, seen: bool = True) -> np.ndarray:
+        """Which of these eye hits [(x, y, z)] lie on what the map has: within ON_MAP_M of a mapped obstacle
+        (exact, at that height), or (seen) where add_seen() put something (no height: anywhere in its area)."""
+        p = np.asarray(points, float).reshape(-1, 3)
+        out = np.zeros(len(p), bool)
+        for kind, pos, size, _ in self._mapped_all:
+            half_h = size[2] if kind == 'box' else size[1]
+            if kind == 'box':
+                d = np.hypot(np.maximum(np.abs(p[:, 0] - pos[0]) - size[0], 0.0),
+                             np.maximum(np.abs(p[:, 1] - pos[1]) - size[1], 0.0))
+            else:
+                d = np.maximum(np.hypot(p[:, 0] - pos[0], p[:, 1] - pos[1]) - size[0], 0.0)
+            out |= (d <= ON_MAP_M) & (np.abs(p[:, 2] - pos[2]) <= half_h + ON_MAP_M)
+        for k in np.nonzero(~out)[0] if seen else ():
+            i, j = self._cell(p[k, 0], p[k, 1])
+            out[k] = self._inside(i, j) and bool(self.seen[i, j])
+        return out
+
+    def seen_at(self, points) -> bool:
+        """Whether any of these points (x, y) lies on what add_seen() put on the map."""
+        for x, y in points:
+            i, j = self._cell(x, y)
+            if self._inside(i, j) and self.seen[i, j]:
+                return True
+        return False
 
     def free(self, x: float, y: float) -> bool:
         i, j = self._cell(x, y)

@@ -8,5 +8,6 @@ mujoco==3.16.0
 
 numpy>=1.24,<3
 opencv-python>=4.8,<6
+imageio-ffmpeg>=0.5            # an ffmpeg binary: the sim's --video recordings in H.264
 Jinja2>=3.0                    # firmware build tooling
 tomli>=2.0; python_version < "3.11"   # crazysim.py reads TOML params
