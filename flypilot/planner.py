@@ -2,7 +2,9 @@
 
 The map is an occupancy grid of the room at flight altitude, built from the scene file's obstacles and
 grown by CLEARANCE_M, so a planned path never passes closer than that to a mapped obstacle. A* finds
-the shortest grid path; line-of-sight shortcuts then turn it into a few straight legs.
+the cheapest grid path, where a step within COMFORT_M of a mapped obstacle costs more, so the path keeps
+its distance where there is room; line-of-sight shortcuts that keep that distance then turn it into a
+few straight legs.
 
 What is on the map is a choice, because the planner and the avoidance layer split the work:
     all        every obstacle in the scene: the planner routes around everything, avoidance is the backup
@@ -14,8 +16,8 @@ Where the map comes from: here, CrazySim's scene file (load_obstacles). For a re
 floor plan, building footprints (e.g. OpenStreetMap), or a map the drone builds with its own sensors;
 the planner only needs the obstacle list.
 
-Planning runs when a leg starts and after an avoidance episode, never per control tick (one plan takes
-a few ms here). On a real Crazyflie it would run on the ground station, which already sends the setpoints.
+Planning runs when a leg starts, after an avoidance episode and when the map grows, never per control
+tick (one plan takes 1-30 ms here). On a real Crazyflie it would run on the ground station, which already sends the setpoints.
 
 The map also helps the avoidance choose a side. With each leg's plan comes a cost-to-go field: how far
 the stop is from everywhere, around everything on the map (cost_field, ~10 ms). route_cost() then says
@@ -38,7 +40,13 @@ SCENES = {  # name -> scene file; launch.py starts the sim on the one a route as
 }
 
 CELL_M = 0.05
-CLEARANCE_M = 0.3   # planned paths keep this far from mapped obstacles (stops need orders.KEEP_OUT_M = 0.35)
+CLEARANCE_M = 0.3   # planned paths keep this far from mapped obstacles (stops need orders.KEEP_OUT_M = 0.35)...
+COMFORT_M = 0.8     # ...and this far where there is room: a step closer than this costs more (PROXIMITY_COST). At
+                    # just the clearance, the shortest path grazed it: the drone passed 0.23-0.27 m from both tree
+                    # crowns, edge to edge, for 4-8 s each (sc1/sc2_showcase). The clearance alone stays the rule in
+                    # tight spots (a stop 0.45 m from a crate)
+PROXIMITY_COST = 2.0  # a step at CLEARANCE_M costs 1 + this times one at COMFORT_M or beyond (linear in between)
+SHORTCUT_GIVE_M = 0.1  # a straight leg may pass this much closer to something mapped than the grid path did
 EDGE_M = 0.1        # and this far inside the geofence
 MAPS = ('all', 'building', 'notrees', 'none')
 MAP_HELP = {'all': 'every obstacle is mapped', 'building': 'crates, new poles not mapped: avoidance handles them',
@@ -150,6 +158,7 @@ class Planner:
         self._edge = ((self._X < self.x0 + m) | (self._X > x1 - m) | (self._Y < self.y0 + m) | (self._Y > y1 - m))
         self.seen = np.zeros(self._edge.shape, bool)  # cells near obstacles the drone saw that aren't on the map
         self._seen_cells = np.zeros(self._edge.shape, bool)  # ...the cells of their points themselves
+        self._seen_dist = np.full(self._edge.shape, COMFORT_M)  # ...each cell's distance to them, up to COMFORT_M
         self.seen_points = []                          # [(x, y)]: what was added, for the top views
         self._field = self._field_goal = None          # cost_field()
         self.set_map(map_name)
@@ -163,6 +172,7 @@ class Planner:
         self.mapped = [o for o in self.obstacles if on_map(o[3], map_name)]
         self._mapped_all = [o for o in self._all if on_map(o[3], map_name)]
         blocked = self._edge.copy()
+        dist = np.full(self._edge.shape, COMFORT_M)
         for kind, pos, size, _ in self.mapped:
             if kind == 'box':
                 d = np.hypot(np.maximum(np.abs(self._X - pos[0]) - size[0], 0.0),
@@ -170,7 +180,8 @@ class Planner:
             else:
                 d = np.maximum(np.hypot(self._X - pos[0], self._Y - pos[1]) - size[0], 0.0)
             blocked |= d < CLEARANCE_M
-        self._mapped_blocked = blocked
+            np.minimum(dist, d, out=dist)
+        self._mapped_blocked, self._mapped_dist = blocked, dist
         self._update_blocked()
 
     def add_seen(self, points) -> int:
@@ -185,11 +196,12 @@ class Planner:
             if not self._inside(i, j) or self._seen_cells[i, j]:
                 continue
             self._seen_cells[i, j] = True
-            i0, i1 = self._cell(x - CLEARANCE_M, y - CLEARANCE_M), self._cell(x + CLEARANCE_M, y + CLEARANCE_M)
+            i0, i1 = self._cell(x - COMFORT_M, y - COMFORT_M), self._cell(x + COMFORT_M, y + COMFORT_M)
             a0, a1 = max(i0[0], 0), min(i1[0] + 1, self.nx)
             b0, b1 = max(i0[1], 0), min(i1[1] + 1, self.ny)
-            near = np.hypot(self._X[a0:a1, b0:b1] - x, self._Y[a0:a1, b0:b1] - y) < CLEARANCE_M
-            self.seen[a0:a1, b0:b1] |= near
+            d = np.hypot(self._X[a0:a1, b0:b1] - x, self._Y[a0:a1, b0:b1] - y)
+            self.seen[a0:a1, b0:b1] |= d < CLEARANCE_M
+            np.minimum(self._seen_dist[a0:a1, b0:b1], d, out=self._seen_dist[a0:a1, b0:b1])
             self.seen_points.append((float(x), float(y)))
             added += 1
         if added:
@@ -199,6 +211,10 @@ class Planner:
     def _update_blocked(self):
         self.blocked = self._mapped_blocked | self.seen
         self._flat = self.blocked.ravel().tolist()  # plain list: much faster to index in the A* loop
+        dist = np.minimum(self._mapped_dist, self._seen_dist)  # to the nearest mapped thing, up to COMFORT_M
+        self._dist = dist.ravel().tolist()
+        near = np.clip((COMFORT_M - dist) / (COMFORT_M - CLEARANCE_M), 0.0, 1.0)
+        self._step_cost = (1.0 + PROXIMITY_COST * near).ravel().tolist()
         self._reach_from = self._reach = None
         self._field = self._field_goal = None  # the map changed: the next leg's plan computes it again
 
@@ -375,7 +391,8 @@ class Planner:
         return pts
 
     def _astar(self, s: tuple, g: tuple) -> list | None:
-        ny, flat = self.ny, self._flat
+        """Cheapest grid path: length, times _step_cost near mapped things (so it keeps COMFORT_M where it can)."""
+        ny, flat, near = self.ny, self._flat, self._step_cost
         n = self.nx * ny
         start, goal = s[0] * ny + s[1], g[0] * ny + g[1]
         gx, gy = g
@@ -398,7 +415,7 @@ class Planner:
                     continue
                 if di and dj and (flat[ci * ny + j] or flat[i * ny + cj]):
                     continue  # no squeezing diagonally between two blocked cells
-                c = c0 + step
+                c = c0 + step * near[nb]
                 if c < cost[nb]:
                     cost[nb], came[nb] = c, cur
                     dx, dy = abs(i - gx), abs(j - gy)
@@ -412,24 +429,32 @@ class Planner:
         return cells[::-1]
 
     def _shortcut(self, cells: list) -> list:
-        """Keep only the turning points: from each kept cell, go as far along the path as is visible."""
+        """Keep only the turning points: from each kept cell, go as far along the path as is visible, and no
+        closer to anything mapped than the grid path itself went there (less SHORTCUT_GIVE_M). Straightened
+        by visibility alone, the legs went back to grazing the clearance the grid path had kept away from."""
+        ny, dist = self.ny, self._dist
+        d = lambda c: dist[c[0] * ny + c[1]]  # noqa: E731
         out, anchor, k = [cells[0]], 0, 1
+        low = min(d(cells[0]), d(cells[min(1, len(cells) - 1)]))  # the grid path's closest, anchor to k
         while k < len(cells) - 1:
-            if self._visible(cells[anchor], cells[k + 1]):
-                k += 1
+            floor = min(low, d(cells[k + 1]))
+            if self._visible(cells[anchor], cells[k + 1], floor - SHORTCUT_GIVE_M):
+                k, low = k + 1, floor
             else:
                 out.append(cells[k])
                 anchor, k = k, k + 1
+                low = min(d(cells[anchor]), d(cells[k]))
         out.append(cells[-1])
         return out
 
-    def _visible(self, a: tuple, b: tuple) -> bool:
+    def _visible(self, a: tuple, b: tuple, floor: float = 0.0) -> bool:
+        """Whether the straight line a -> b crosses no blocked cell, nor one nearer than `floor` to anything mapped."""
         steps = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) * 2) + 1
-        ny, flat = self.ny, self._flat
+        ny, flat, dist = self.ny, self._flat, self._dist
         for k in range(steps + 1):
             t = k / steps
             i, j = int(round(a[0] + (b[0] - a[0]) * t)), int(round(a[1] + (b[1] - a[1]) * t))
-            if flat[i * ny + j]:
+            if flat[i * ny + j] or dist[i * ny + j] < floor:
                 return False
         return True
 

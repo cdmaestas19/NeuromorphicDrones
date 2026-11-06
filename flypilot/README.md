@@ -150,8 +150,11 @@ which opens next to the 3D window:
 
 Each leg follows a path planned on a map (`planner.py`):
 - a 5 cm occupancy grid of the room at flight altitude
-- the map's obstacles grown by 0.3 m
-- A* search, then straightened into a few legs
+- the map's obstacles grown by 0.3 m: no path comes closer than that
+- A* search, then straightened into a few legs. Where there is room the path keeps ~0.8 m from anything
+  on the map (closer steps cost more, and straightening doesn't undo it); only tight spots, such as a
+  stop beside a crate, use the 0.3 m. With the 0.3 m alone the shortest path grazed it: going round the
+  tree crowns, the drone passed them at under 0.3 m.
 
 The drone flies the legs without stopping, slowing down before sharp turns. A plan takes a few
 milliseconds and runs once per leg, never in the 20 Hz control loop.

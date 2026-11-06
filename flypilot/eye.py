@@ -388,8 +388,11 @@ class CollisionCourse:
         on the scene's mapped obstacles (planner.mapped_at, seen=False). An object mostly on them stands
         still: walls, a beam, a partition slid along with the passing (or climbing, descending) drone as
         their visible stretch changed, counted as movers, and a drone that had come down beside a crate
-        dodged the room's east wall eleven times (fe1_blocked). Only the scene's: what the drone mapped
-        itself may be a person who stood still until then."""
+        dodged the room's east wall eleven times (fe1_blocked). Nor is it a collision course: the map's
+        obstacles are the planner's (its paths keep their clearance, the flight caps the speed near them).
+        A planned path between a tree and the street's west wall alarmed the brain at the wall, and it
+        escaped from the wall into the tree, to 0.11 m (cm1_showcase). Only the scene's: what the drone
+        mapped itself may be a person who stood still until then, and its shape is a guess."""
         t, pos, _ = reading
         while self._moved_at and t - self._moved_at[0][0] > self.MOVERS_KEPT_S:
             self._moved_at.popleft()
@@ -445,7 +448,7 @@ class CollisionCourse:
             rvx, rvy = vox - vdx, voy - vdy  # the object's motion relative to the drone
             v2 = rvx * rvx + rvy * rvy
             w, miss_vec = 0.0, (0.0, 0.0)
-            if v2 > 0.05 ** 2:
+            if v2 > 0.05 ** 2 and not on_map:
                 rx, ry = px - pos[0], py - pos[1]
                 t_cpa = -(rx * rvx + ry * rvy) / v2
                 mx, my = rx + rvx * t_cpa, ry + rvy * t_cpa

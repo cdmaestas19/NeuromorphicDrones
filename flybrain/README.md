@@ -177,8 +177,10 @@ Each 50 ms tick:
    mostly on the scene's map (a wall's visible stretch slides as the drone passes, which looked like
    motion). An object counts
    if, on the current relative motion, any of its points will pass within 0.15 m of the drone, and not
-   at all beyond 0.3 m (the planner's clearance). An approaching person counts, and so does a wall the
-   drone flies at, but a crate it flies past does not. Each eye's drive is its most looming 30-degree
+   at all beyond 0.3 m (the planner's clearance). An approaching person counts, and so does a crate the
+   drone flies at, but a crate it flies past does not. Walls and anything else on the scene's map never
+   count: the planner keeps its paths clear of them (a wall beside a planned path once alarmed the brain,
+   and the escape went into a tree). Each eye's drive is its most looming 30-degree
    field (90th percentile) / 5 per second, capped at 1.
 2. **Brain.** The drive (the left eye's x 1.35, see below) sets the Poisson rate of that eye's LC4 and
    LPLC2 neurons (drive x 150 Hz, the model's activation rate). The brain simulates 50 ms and returns
@@ -225,7 +227,8 @@ Each 50 ms tick:
    for example when landing.
 
 The flight adds the same safety rules around every policy, the fly brain included:
-- **No dodging into things.** A dodge slows down rather than fly into what the eye sees in its path.
+- **No dodging into things.** A dodge slows down rather than fly into what the eye sees in its path,
+  stopping 0.3 m short of it (the planner's clearance).
 - **Down only when clear below.** After a climb, the drone returns to its route altitude (up to 1 m/s,
   0.4 m/s near the ground), and only while the eye's downward-looking rows see room below it: never
   onto a person or a cart. What is on the map counts only right under it (a crate beside it doesn't).

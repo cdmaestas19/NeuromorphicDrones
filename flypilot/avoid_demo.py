@@ -68,7 +68,8 @@ MAP_TTC_S = 2.5           # never command a time-to-collision below this with a 
 MAP_CORRIDOR_M = 0.25     # ...also along lines this far either side of the path (policies.GeometricTTC360Policy
                           # counts what is within 0.3 m of the path)
 DODGE_HALF_WIDTH_M = 0.15  # a dodge slows for what the eye sees within this of its line (drone 0.07 m + margin)...
-DODGE_GAP_M = 0.2          # ...so as to stop this short of it...
+DODGE_GAP_M = 0.3          # ...so as to stop this short of it (the planner's clearance; at 0.2 an escape climbing
+                           # past a tree crown ended 0.11 m from it, edge to edge: cm1_showcase)...
 DODGE_TTC_S = 0.8          # ...taking at least this long to get there
 SEEN_RANGE_M = 2.5         # after an episode, static things the eye sees within this go on the planner's map: all
                            # of each, as far as eye.footprint() can tell from the side it sees. (1.2 m and only the

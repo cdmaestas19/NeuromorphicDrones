@@ -73,7 +73,8 @@ rule. A negative result is an acceptable result.
   `planner.distance_ahead(z=)`: the mapped obstacles at the drone's actual
   height, any height: a drone left high by an escape flew into a 1.5 m beam
   the 0.5 m plan didn't have),
-  a dodge slows rather than fly into what the eye sees (`_dodge_safe`), the
+  a dodge slows rather than fly into what the eye sees (`_dodge_safe`,
+  stopping `DODGE_GAP_M` 0.3 m short, the planner's clearance), the
   clear-out backs a finished dodge out of the resume clearance (from the eye
   when there is one), setpoint kept 0.1 m inside the geofence (0.4 m below the
   ceiling), descents only while the eye sees room below (`eye.clear_below`:
@@ -180,8 +181,10 @@ rule. A negative result is an acceptable result.
     motion, or when >= half its points lie on the scene's mapped obstacles
     (`Sensors.mapped` = `planner.mapped_at(seen=False)`; walls/beam/partition
     slid along as their visible stretch changed and counted as movers: 11
-    dodges of a wall; not what the drone mapped itself, which may be a person
-    who stood still; bench.py replays without it);
+    dodges of a wall; nor a collision course: the map's obstacles are the
+    planner's, and a wall alarmed the brain beside a planned path, which
+    escaped into a tree crown, cm1_showcase; not what the drone mapped
+    itself, which may be a person who stood still; bench.py replays without it);
     "moved" needs 3 readings of steady motion; counts if a point passes
     within 0.15 m, not beyond 0.3 m): LPLC2's selectivity.
     Ideal/geometric, not image-based.
@@ -236,7 +239,11 @@ rule. A negative result is an acceptable result.
   - Finding: the right eye's pathway drives the giant fibers at much weaker
     looming than the left's (in the data, not the cut); left as is.
 - Every flight is stops on planned paths. `planner.py` (5 cm occupancy grid,
-  0.3 m clearance, A*, re-plan after every dodge) plans on a map:
+  0.3 m clearance, A*, re-plan after every dodge; steps within `COMFORT_M`
+  0.8 m of anything mapped cost up to 3x, `PROXIMITY_COST`, and shortcuts
+  keep the grid path's distance, `SHORTCUT_GIVE_M`: at clearance only, the
+  shortest path grazed it and the drone passed 0.23-0.27 m from both tree
+  crowns, edge to edge, sc1/sc2_showcase) plans on a map:
   `all` / `building` (no crates) / `none`. Whatever is not on the map is the
   avoidance layer's job. Test scenarios in `routes.py` are stops plus a map
   (`blocked` uses `building`, so crate3 is left to the avoidance).
